@@ -429,6 +429,8 @@ export function App() {
 
   const [downloadDir, setDownloadDir] = useState<string>('/home/user/Downloads/LocalSend');
   const [autoAccept, setAutoAccept] = useState<boolean>(true);
+  const [receiveProgressLine, setReceiveProgressLine] = useState<string>('');
+  const [receiveProgressPercent, setReceiveProgressPercent] = useState<number | undefined>(undefined);
 
   // Subscribe to receive mode events
   useEffect(() => {
@@ -437,6 +439,18 @@ export function App() {
       try {
         const data = JSON.parse(event.data);
         appendLog(data.message, data.level || 'info');
+      } catch {}
+    });
+
+    es.addEventListener('progress', (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.rawLine) {
+          setReceiveProgressLine(data.rawLine);
+        }
+        if (typeof data.percent === 'number') {
+          setReceiveProgressPercent(data.percent);
+        }
       } catch {}
     });
 
@@ -461,6 +475,12 @@ export function App() {
     es.addEventListener('completed', (event) => {
       try {
         const data = JSON.parse(event.data);
+        setReceiveProgressPercent(100);
+        setTimeout(() => {
+          setReceiveProgressPercent(undefined);
+          setReceiveProgressLine('');
+        }, 3000);
+
         appendLog(`文件传输已顺利完成！文件保存在: ${data.downloadDir}`, 'success');
         fetch('/api/receive/files')
           .then((r) => r.json())
@@ -609,7 +629,7 @@ export function App() {
   const canSend = Boolean(selectedTarget.trim()) && files.length > 0;
 
   return (
-    <div className="min-h-screen flex flex-col bg-slate-100 dark:bg-slate-900 text-slate-800 dark:text-slate-100 font-sans">
+    <div className="h-screen max-h-screen overflow-hidden flex flex-col bg-slate-100 dark:bg-slate-900 text-slate-800 dark:text-slate-100 font-sans">
       <Header
         settings={settings}
         localAddresses={localAddresses}
@@ -620,10 +640,10 @@ export function App() {
         onToggleDarkMode={() => setDarkMode(!darkMode)}
       />
 
-      <main className="flex-1 p-3 md:p-4 flex flex-col gap-3 max-w-7xl w-full mx-auto overflow-y-auto min-h-0">
+      <main className="flex-1 p-2 md:p-3 flex flex-col gap-2.5 max-w-7xl w-full mx-auto min-h-0 overflow-hidden">
         {/* Top Splitter */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 min-h-[280px]">
-          <div className="lg:col-span-4 h-full">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-2.5 flex-1 min-h-[260px] overflow-hidden">
+          <div className="lg:col-span-4 h-full min-h-0">
             <DevicePanel
               devices={devices}
               selectedTarget={selectedTarget}
@@ -636,7 +656,7 @@ export function App() {
             />
           </div>
 
-          <div className="lg:col-span-8 h-full">
+          <div className="lg:col-span-8 h-full min-h-0">
             <FilePanel
               files={files}
               onAddFiles={handleAddFiles}
@@ -647,8 +667,8 @@ export function App() {
           </div>
         </div>
 
-        {/* Real-time Console Log with stable height and full visibility */}
-        <div className="h-[220px] md:h-[250px] shrink-0 min-h-0">
+        {/* Real-time Console Log with guaranteed visibility and bottom scroll */}
+        <div className="h-[200px] md:h-[220px] shrink-0 min-h-0">
           <LogPanel logs={logs} onClearLogs={() => setLogs([])} />
         </div>
       </main>
@@ -682,6 +702,9 @@ export function App() {
         onAcceptTransfer={handleAcceptTransfer}
         onDeclineTransfer={handleDeclineTransfer}
         onOpenFolder={handleOpenFolder}
+        localAddresses={localAddresses}
+        currentProgressLine={receiveProgressLine}
+        currentProgressPercent={receiveProgressPercent}
       />
 
       <HistoryDrawer

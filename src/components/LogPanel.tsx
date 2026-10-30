@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Terminal, Copy, Trash2, ArrowDown, Check } from 'lucide-react';
 import { LogEntry } from '../types';
 
@@ -9,59 +9,89 @@ interface LogPanelProps {
 
 export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClearLogs }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const bottomMarkerRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [copied, setCopied] = useState(false);
+  const [copyStatusMsg, setCopyStatusMsg] = useState('');
 
-  // Auto-scroll to bottom whenever logs change
-  useEffect(() => {
-    if (autoScroll && scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  // Auto-scroll to bottom whenever logs change or autoScroll is toggled
+  const scrollToBottom = useCallback((force = false) => {
+    if (force || autoScroll) {
+      if (scrollRef.current) {
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight + 2000;
+      }
+      bottomMarkerRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
     }
-  }, [logs, autoScroll]);
+  }, [autoScroll]);
 
-  // Robust clipboard copy with fallback that works on HTTP, remote IPs, and all browsers
+  useEffect(() => {
+    scrollToBottom();
+  }, [logs, scrollToBottom]);
+
+  // Robust clipboard copy with fallback that works on HTTP, remote IPs, and all environments
   const handleCopyLogs = () => {
     if (logs.length === 0) return;
     const text = logs.map((l) => `[${l.timestamp}] ${l.message}`).join('\n');
 
-    if (navigator.clipboard && window.isSecureContext) {
+    let copiedSuccessfully = false;
+
+    // 1. Try modern clipboard API if available
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
       navigator.clipboard
         .writeText(text)
         .then(() => {
-          setCopied(true);
-          setTimeout(() => setCopied(false), 2000);
+          triggerCopiedFeedback(`已复制 ${logs.length} 行日志`);
         })
-        .catch(() => fallbackCopy(text));
-    } else {
-      fallbackCopy(text);
+        .catch(() => {
+          fallbackCopy(text);
+        });
+      return;
     }
+
+    fallbackCopy(text);
   };
 
   const fallbackCopy = (text: string) => {
     try {
       const textarea = document.createElement('textarea');
       textarea.value = text;
-      textarea.style.position = 'fixed';
-      textarea.style.left = '-999999px';
-      textarea.style.top = '-999999px';
       textarea.setAttribute('readonly', '');
+      textarea.style.position = 'absolute';
+      textarea.style.left = '0';
+      textarea.style.top = '0';
+      textarea.style.width = '2em';
+      textarea.style.height = '2em';
+      textarea.style.padding = '0';
+      textarea.style.border = 'none';
+      textarea.style.outline = 'none';
+      textarea.style.boxShadow = 'none';
+      textarea.style.background = 'transparent';
+      textarea.style.opacity = '0.01';
       document.body.appendChild(textarea);
+      textarea.focus();
       textarea.select();
+      textarea.setSelectionRange(0, textarea.value.length);
+
       const successful = document.execCommand('copy');
       document.body.removeChild(textarea);
+
       if (successful) {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 2000);
+        triggerCopiedFeedback(`已复制 ${logs.length} 行日志`);
+      } else {
+        triggerCopiedFeedback('请手动按 Ctrl+A 选中日志后复制');
       }
     } catch (err) {
-      console.warn('Fallback copy error:', err);
+      triggerCopiedFeedback('复制失败，请全选日志内容复制');
     }
   };
 
-  const scrollToBottom = () => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
+  const triggerCopiedFeedback = (msg: string) => {
+    setCopied(true);
+    setCopyStatusMsg(msg);
+    setTimeout(() => {
+      setCopied(false);
+      setCopyStatusMsg('');
+    }, 2500);
   };
 
   const getLevelStyle = (level: LogEntry['level']) => {
@@ -78,7 +108,7 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClearLogs }) => {
   };
 
   return (
-    <div className="bg-slate-900 text-slate-200 rounded-lg border border-slate-700/80 flex flex-col h-full shadow-xs min-h-0 overflow-hidden">
+    <div className="bg-slate-900 text-slate-200 rounded-lg border border-slate-700/80 flex flex-col h-full shadow-xs min-h-0 overflow-hidden relative">
       {/* Log Header */}
       <div className="px-3 py-1.5 border-b border-slate-800 bg-slate-950/80 rounded-t-lg flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2">
@@ -89,6 +119,11 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClearLogs }) => {
           <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400 font-mono">
             {logs.length} 行
           </span>
+          {copyStatusMsg && (
+            <span className="text-[11px] font-medium text-emerald-400 bg-emerald-950/80 border border-emerald-800/60 px-2 py-0.5 rounded animate-fade-in">
+              {copyStatusMsg}
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-1.5">
@@ -96,7 +131,7 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClearLogs }) => {
             type="button"
             onClick={() => {
               setAutoScroll(true);
-              scrollToBottom();
+              scrollToBottom(true);
             }}
             className={`px-2 py-0.5 rounded text-[11px] font-medium flex items-center gap-1 transition-colors ${
               autoScroll
@@ -112,13 +147,17 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClearLogs }) => {
           <button
             type="button"
             onClick={handleCopyLogs}
-            className="px-2 py-0.5 rounded text-[11px] font-medium text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 flex items-center gap-1 transition-colors"
-            title="复制全部运行日志"
+            className={`px-2 py-0.5 rounded text-[11px] font-medium flex items-center gap-1 transition-colors ${
+              copied
+                ? 'bg-emerald-900/80 text-emerald-300 border border-emerald-700/80'
+                : 'text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700'
+            }`}
+            title="复制全部运行日志到剪贴板"
           >
             {copied ? (
               <>
                 <Check className="h-3 w-3 text-emerald-400" />
-                <span className="text-emerald-400">已复制</span>
+                <span>已复制</span>
               </>
             ) : (
               <>
@@ -139,10 +178,18 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClearLogs }) => {
         </div>
       </div>
 
-      {/* Log Output Console with generous bottom padding so bottom lines are never clipped */}
+      {/* Log Output Console with dedicated bottom marker anchor */}
       <div
         ref={scrollRef}
-        className="flex-1 overflow-x-auto overflow-y-auto p-3 font-mono text-[11.5px] leading-relaxed space-y-1 select-text bg-slate-950/50 min-h-0 pb-10"
+        onWheel={(e) => {
+          // If user scrolls up, pause autoScroll; if scrolled back to bottom, resume
+          if (scrollRef.current) {
+            const { scrollTop, scrollHeight, clientHeight } = scrollRef.current;
+            const isAtBottom = scrollHeight - scrollTop - clientHeight < 40;
+            setAutoScroll(isAtBottom);
+          }
+        }}
+        className="flex-1 overflow-x-auto overflow-y-auto p-3 font-mono text-[11.5px] leading-relaxed space-y-1 select-text bg-slate-950/60 min-h-0"
       >
         {logs.length === 0 ? (
           <div className="text-slate-600 italic py-6 text-center">暂无日志输出</div>
@@ -158,6 +205,8 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClearLogs }) => {
             </div>
           ))
         )}
+        {/* Scroll anchor that ensures the very last line is never cut off */}
+        <div ref={bottomMarkerRef} className="h-8 shrink-0" />
       </div>
     </div>
   );

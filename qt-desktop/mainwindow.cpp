@@ -1071,6 +1071,10 @@ void MainWindow::startReceive()
     saveSettings();
     stopDiscovery();
 
+    // Release port 53317 if an older CLI process is lingering
+    QProcess::execute(QStringLiteral("pkill"), QStringList() << QStringLiteral("-9") << QStringLiteral("-f") << QStringLiteral("localsend-cli"));
+    QThread::msleep(200);
+
     const QString downloadsPath = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation) + QStringLiteral("/LocalSend");
     QDir().mkpath(downloadsPath);
 
