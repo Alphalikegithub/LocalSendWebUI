@@ -727,9 +727,18 @@ app.post('/api/receive/start', async (req: Request, res: Response) => {
       spawnArgs = [ptyRunner, cli.path];
     }
 
+    try {
+      fs.writeFileSync('/tmp/localsend_auto_receive.flag', receiveAutoAccept ? '1' : '0');
+    } catch {}
+
     activeReceiveProcess = spawn(spawnCmd, spawnArgs, {
       cwd: customDownloadDir,
-      env: { ...process.env, TERM: 'xterm-256color', PYTHONUNBUFFERED: '1', LOCALSEND_AUTO_RECEIVE: '1' },
+      env: {
+        ...process.env,
+        TERM: 'xterm-256color',
+        PYTHONUNBUFFERED: '1',
+        LOCALSEND_AUTO_RECEIVE: receiveAutoAccept ? '1' : '0',
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
@@ -839,23 +848,15 @@ app.post('/api/receive/start', async (req: Request, res: Response) => {
         };
 
         if (receiveAutoAccept) {
-          // Auto-accept: send 'p\r\n' (pair & accept) cleanly to PTY
+          // Auto-accept: send 'y\r\n' (accept transfer once without permanently pairing)
           try {
-            activeReceiveProcess?.stdin?.write('p\r\n');
-            // In case the CLI expects 'y', also send fallback after short delay if needed
-            setTimeout(() => {
-              if (activeReceiveProcess && !activeReceiveProcess.killed) {
-                try {
-                  activeReceiveProcess.stdin?.write('y\r\n');
-                } catch {}
-              }
-            }, 300);
+            activeReceiveProcess?.stdin?.write('y\r\n');
           } catch (err: any) {
             console.error('Failed to write accept to stdin:', err);
           }
 
           broadcastReceive('log', {
-            message: `【自动接收已触发】已自动向终端发送接受确认 (P) 并信任来自 ${senderName} 的传输请求。`,
+            message: `【自动接收已触发】已自动确认接受来自 ${senderName} 的文件传输请求。`,
             level: 'success',
           });
         } else {
@@ -929,6 +930,102 @@ app.post('/api/receive/respond', (req: Request, res: Response) => {
   });
 
   res.json({ success: true, action: choice });
+});
+
+// 7a-1. Dynamically toggle auto-accept in real time
+app.post('/api/receive/auto-accept', (req: Request, res: Response) => {
+  const { enabled } = req.body;
+  receiveAutoAccept = Boolean(enabled);
+
+  try {
+    fs.writeFileSync('/tmp/localsend_auto_receive.flag', receiveAutoAccept ? '1' : '0');
+  } catch {}
+
+  broadcastReceive('status', {
+    running: activeReceiveProcess !== null,
+    downloadDir: customDownloadDir,
+    autoAccept: receiveAutoAccept,
+  });
+
+  broadcastReceive('log', {
+    message: receiveAutoAccept
+      ? '【设置变更】已开启【自动接收局域网传输】（收到请求自动确认并保存）。'
+      : '【设置变更】已关闭【自动接收局域网传输】（收到新文件请求将弹出窗口由您手动确认）。',
+    level: 'info',
+  });
+
+  res.json({ success: true, autoAccept: receiveAutoAccept });
+});
+
+// 7a-2. Reset paired/trusted devices in LocalSend CLI storage
+app.post('/api/receive/reset-paired', async (_req: Request, res: Response) => {
+  const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+  const dirs = [
+    path.join(configHome, 'localsend-cli'),
+    path.join(os.homedir(), '.localsend'),
+  ];
+  const clearedFiles: string[] = [];
+
+  for (const dir of dirs) {
+    if (fs.existsSync(dir)) {
+      try {
+        const files = fs.readdirSync(dir);
+        for (const file of files) {
+          // Strictly protect TLS certificate and private key identity
+          if (file === 'identity.pem' || file.endsWith('.pem') || file.endsWith('.key') || file.endsWith('.crt')) {
+            continue;
+          }
+          if (
+            file.includes('pair') ||
+            file.includes('device') ||
+            file.includes('peer') ||
+            file.endsWith('.json') ||
+            file.endsWith('.toml')
+          ) {
+            try {
+              const full = path.join(dir, file);
+              if (file.endsWith('.json')) {
+                try {
+                  const content = JSON.parse(fs.readFileSync(full, 'utf8'));
+                  if (Array.isArray(content)) {
+                    fs.writeFileSync(full, JSON.stringify([], null, 2));
+                  } else if (typeof content === 'object') {
+                    if (content.paired_devices) content.paired_devices = [];
+                    if (content.devices) content.devices = [];
+                    if (content.peers) content.peers = [];
+                    fs.writeFileSync(full, JSON.stringify(content, null, 2));
+                  }
+                  clearedFiles.push(file);
+                } catch {
+                  fs.unlinkSync(full);
+                  clearedFiles.push(file);
+                }
+              } else {
+                fs.unlinkSync(full);
+                clearedFiles.push(file);
+              }
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+  }
+
+  // If receive mode is currently running, cleanly restart it so CLI reloads its pairing state without port conflicts
+  if (activeReceiveProcess && !activeReceiveProcess.killed) {
+    await forceReleasePort53317();
+  }
+
+  broadcastReceive('log', {
+    message: '【已重置配对记录】已清空已记住的信任设备列表（保留身份证书）。下次任何设备发送文件都将重新弹出确认提示！',
+    level: 'success',
+  });
+
+  res.json({
+    success: true,
+    clearedFiles,
+    message: '已清空配对记录。下次对方发来文件将重新弹出手动确认窗口。',
+  });
 });
 
 // 7b. Launch in system desktop terminal (Optional alternative)

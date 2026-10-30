@@ -435,6 +435,18 @@ export function App() {
   // Subscribe to receive mode events
   useEffect(() => {
     const es = new EventSource('/api/receive/stream');
+    es.addEventListener('status', (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (typeof data.autoAccept === 'boolean') {
+          setAutoAccept(data.autoAccept);
+        }
+        if (data.downloadDir) {
+          setDownloadDir(data.downloadDir);
+        }
+      } catch {}
+    });
+
     es.addEventListener('log', (event) => {
       try {
         const data = JSON.parse(event.data);
@@ -558,6 +570,31 @@ export function App() {
       }
     } catch (err: any) {
       appendLog(`打开文件夹失败: ${err.message}`, 'error');
+    }
+  };
+
+  const handleToggleAutoAccept = async (enabled: boolean) => {
+    setAutoAccept(enabled);
+    try {
+      await fetch('/api/receive/auto-accept', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+    } catch (err: any) {
+      appendLog(`同步自动接收设置失败: ${err.message}`, 'error');
+    }
+  };
+
+  const handleResetPaired = async () => {
+    try {
+      const res = await fetch('/api/receive/reset-paired', { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        appendLog('已清空已信任设备记录，下次局域网发送将重新弹出接收确认窗口。', 'success');
+      }
+    } catch (err: any) {
+      appendLog(`重置配对失败: ${err.message}`, 'error');
     }
   };
 
@@ -697,7 +734,8 @@ export function App() {
         settings={settings}
         downloadDir={downloadDir}
         autoAccept={autoAccept}
-        onToggleAutoAccept={setAutoAccept}
+        onToggleAutoAccept={handleToggleAutoAccept}
+        onResetPaired={handleResetPaired}
         pendingTransfers={pendingTransfers}
         onAcceptTransfer={handleAcceptTransfer}
         onDeclineTransfer={handleDeclineTransfer}

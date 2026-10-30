@@ -32,6 +32,7 @@ interface ReceiveModalProps {
   onAcceptTransfer: (transferId: string, action?: 'p' | 'y') => void;
   onDeclineTransfer: (transferId: string) => void;
   onOpenFolder: () => void;
+  onResetPaired?: () => void;
   localAddresses?: { ip: string; name: string }[];
   currentProgressLine?: string;
   currentProgressPercent?: number;
@@ -48,6 +49,7 @@ export const ReceiveModal: React.FC<ReceiveModalProps> = ({
   onAcceptTransfer,
   onDeclineTransfer,
   onOpenFolder,
+  onResetPaired,
   localAddresses = [],
   currentProgressLine,
   currentProgressPercent,
@@ -59,8 +61,28 @@ export const ReceiveModal: React.FC<ReceiveModalProps> = ({
   const [showManualModal, setShowManualModal] = useState(false);
   const [copiedCmd, setCopiedCmd] = useState(false);
   const [copiedIp, setCopiedIp] = useState<string | null>(null);
+  const [resettingPaired, setResettingPaired] = useState(false);
+  const [resetSuccess, setResetSuccess] = useState<string | null>(null);
 
   const primaryIp = localAddresses.length > 0 ? localAddresses[0].ip : '127.0.0.1';
+
+  const handleResetPairedDevices = async () => {
+    setResettingPaired(true);
+    setResetSuccess(null);
+    try {
+      if (onResetPaired) {
+        await onResetPaired();
+      } else {
+        await fetch('/api/receive/reset-paired', { method: 'POST' });
+      }
+      setResetSuccess('已清空配对记录！下次对端设备发送文件将重新弹出手动确认窗口。');
+      setTimeout(() => setResetSuccess(null), 6000);
+    } catch {
+      setResetSuccess('重置配对记录失败');
+    } finally {
+      setResettingPaired(false);
+    }
+  };
 
   const handleLaunchTerminal = async () => {
     setTerminalLaunching(true);
@@ -258,18 +280,49 @@ export const ReceiveModal: React.FC<ReceiveModalProps> = ({
               {downloadDir || '/home/user/Downloads/LocalSend'}
             </div>
 
-            <div className="flex items-center justify-between pt-1">
-              <label className="flex items-center gap-2 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={autoAccept}
-                  onChange={(e) => onToggleAutoAccept(e.target.checked)}
-                  className="rounded border-slate-300 text-teal-600 focus:ring-teal-500"
-                />
-                <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                  自动接受局域网传输（收到请求自动确认并保存，无需手动干预）
-                </span>
-              </label>
+            <div className="pt-1 space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="flex items-center gap-2 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={autoAccept}
+                    onChange={(e) => onToggleAutoAccept(e.target.checked)}
+                    className="rounded border-slate-300 text-teal-600 focus:ring-teal-500"
+                  />
+                  <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+                    自动接受局域网传输（收到请求自动确认并保存，无需手动干预）
+                  </span>
+                </label>
+              </div>
+
+              {!autoAccept && (
+                <div className="p-2.5 bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700/60 rounded text-amber-900 dark:text-amber-200 text-xs space-y-1.5 animate-fade-in">
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="leading-relaxed">
+                      已开启<strong>【手动确认模式】</strong>。新设备发送文件时将弹出确认窗口。
+                      <span className="text-[11px] block text-amber-800 dark:text-amber-300 mt-0.5">
+                        注：若该设备此前曾被勾选过“永久配对 (P)”，LocalSend 底层会直接放行。如需强制每次都弹窗，请点击右侧重置。
+                      </span>
+                    </p>
+                    <button
+                      type="button"
+                      disabled={resettingPaired}
+                      onClick={handleResetPairedDevices}
+                      className="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded text-[11px] font-semibold shrink-0 transition-colors shadow-2xs disabled:opacity-50"
+                      title="清空已配对的信任设备记录，恢复弹窗提示"
+                    >
+                      {resettingPaired ? '重置中…' : '重置配对记忆'}
+                    </button>
+                  </div>
+
+                  {resetSuccess && (
+                    <div className="text-[11px] font-medium text-emerald-700 dark:text-emerald-300 flex items-center gap-1 pt-0.5">
+                      <Check className="h-3 w-3 shrink-0" />
+                      <span>{resetSuccess}</span>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
 
