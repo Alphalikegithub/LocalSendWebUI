@@ -54,6 +54,7 @@ export const ReceiveModal: React.FC<ReceiveModalProps> = ({
 }) => {
   const [downloadedFiles, setDownloadedFiles] = useState<{ name: string; size: number; mtime: number }[]>([]);
   const [terminalLaunching, setTerminalLaunching] = useState(false);
+  const [terminalNotice, setTerminalNotice] = useState<string | null>(null);
   const [manualCommand, setManualCommand] = useState<string>('');
   const [showManualModal, setShowManualModal] = useState(false);
   const [copiedCmd, setCopiedCmd] = useState(false);
@@ -63,16 +64,25 @@ export const ReceiveModal: React.FC<ReceiveModalProps> = ({
 
   const handleLaunchTerminal = async () => {
     setTerminalLaunching(true);
+    setTerminalNotice(null);
     try {
       const res = await fetch('/api/system/terminal-receive', { method: 'POST' });
-      const data = await res.json();
-      if (data.success) {
-        alert(data.message || '已在系统终端中启动接收模式');
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch {
+        // Fallback for non-JSON or truncated response
+        data = { success: false, command: `cd "${downloadDir}" && "${settings.cliPath}"` };
+      }
+
+      if (data && data.success) {
+        setTerminalNotice(data.message || '已在系统终端中启动接收模式');
+        setTimeout(() => setTerminalNotice(null), 5000);
       } else {
-        setManualCommand(data.command || `cd "${downloadDir}" && "${settings.cliPath}"`);
+        setManualCommand(data?.command || `cd "${downloadDir}" && "${settings.cliPath}"`);
         setShowManualModal(true);
       }
-    } catch (e: any) {
+    } catch {
       setManualCommand(`cd "${downloadDir}" && "${settings.cliPath}"`);
       setShowManualModal(true);
     } finally {
@@ -142,6 +152,22 @@ export const ReceiveModal: React.FC<ReceiveModalProps> = ({
 
         {/* Content */}
         <div className="p-4 space-y-3.5 overflow-y-auto flex-1 text-slate-800 dark:text-slate-100">
+          {terminalNotice && (
+            <div className="p-3 bg-emerald-50 dark:bg-emerald-950/50 border border-emerald-300 dark:border-emerald-700 text-emerald-800 dark:text-emerald-200 text-xs rounded-lg flex items-center justify-between animate-fade-in shadow-xs">
+              <span className="flex items-center gap-2">
+                <Check className="h-4 w-4 text-emerald-600 shrink-0" />
+                <span>{terminalNotice}</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => setTerminalNotice(null)}
+                className="text-emerald-600 hover:text-emerald-800 dark:hover:text-emerald-100 ml-2"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+
           {/* Real-time Transfer Progress Bar (Shows active transmission in receive mode!) */}
           {(currentProgressPercent !== undefined || currentProgressLine) && (
             <div className="bg-teal-50 dark:bg-teal-950/50 p-3 rounded-lg border border-teal-300 dark:border-teal-700/80 space-y-1.5 shadow-xs animate-fade-in">

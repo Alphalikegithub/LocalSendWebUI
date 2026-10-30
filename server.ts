@@ -215,7 +215,13 @@ async function forceReleasePort53317(): Promise<void> {
     }
   } catch {}
 
-  // 2. Terminate all lingering processes via system fallbacks
+  // 2. Terminate all lingering processes via system fallbacks and free port 53317
+  try {
+    execSync('fuser -k -9 53317/tcp 2>/dev/null');
+  } catch {}
+  try {
+    execSync('fuser -k -9 53317/udp 2>/dev/null');
+  } catch {}
   try {
     execSync('pkill -9 -f localsend-cli 2>/dev/null');
   } catch {}
@@ -224,11 +230,16 @@ async function forceReleasePort53317(): Promise<void> {
   } catch {}
 
   // 3. Allow Linux network stack & socket TIME_WAIT state to clear completely
-  await new Promise((resolve) => setTimeout(resolve, 350));
+  await new Promise((resolve) => setTimeout(resolve, 400));
 }
 
 // Start temporary UDP listener during discovery
 function startMulticastListener(onDeviceFound?: (dev: DiscoveredDevice) => void) {
+  // If receive mode is currently active, DO NOT bind UDP socket because localsend-cli is already bound to 53317!
+  if (activeReceiveProcess && !activeReceiveProcess.killed) {
+    return;
+  }
+
   stopMulticastListener();
 
   try {
@@ -349,6 +360,10 @@ app.get('/api/discover/stream', async (req: Request, res: Response) => {
   const sendEvent = (event: string, data: any) => {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
+
+  req.on('close', () => {
+    stopMulticastListener();
+  });
 
   const identity = resolveIdentity();
   sendEvent('log', { message: '开始发现设备（组播监听 + 本网段扫描）…', level: 'info' });
@@ -714,9 +729,11 @@ app.post('/api/receive/start', async (req: Request, res: Response) => {
 
     activeReceiveProcess = spawn(spawnCmd, spawnArgs, {
       cwd: customDownloadDir,
-      env: { ...process.env, TERM: 'xterm-256color', PYTHONUNBUFFERED: '1' },
+      env: { ...process.env, TERM: 'xterm-256color', PYTHONUNBUFFERED: '1', LOCALSEND_AUTO_RECEIVE: '1' },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+
+    let autoModeChosen = false;
 
     activeReceiveProcess.stdout?.on('data', (data) => {
       const text = data.toString('utf8');
@@ -727,14 +744,46 @@ app.post('/api/receive/start', async (req: Request, res: Response) => {
       const cleanText = text.replace(/\u001b\[[0-9;]*[a-zA-Z]/g, '');
       const lines = cleanText.split(/[\r\n]+/).filter(Boolean);
 
+      // Auto-respond to interactive CLI menu prompt: "Choose mode [1/2/3/4]:"
+      if (!autoModeChosen && (cleanText.includes('Choose mode') || cleanText.includes('[1/2/3/4]'))) {
+        autoModeChosen = true;
+        try {
+          // Send 2 followed by carriage return to select "2) Receive files"
+          activeReceiveProcess?.stdin?.write('2\r\n');
+          broadcastReceive('log', {
+            message: '【CLI 模式已选择】自动选择选项 2 (Receive files)，正在启动监听…',
+            level: 'info',
+          });
+        } catch (err: any) {
+          console.error('Failed to write 2 to stdin:', err);
+        }
+      }
+
       for (const line of lines) {
         // Detect progress bar output (indicatif / carriage return progress)
+        // e.g. "R 富有的椰子 [------------------------------------] 0 B / 586.5 KB [0 B/s] [ETA:"
         // e.g. "Screenshot.jpg [====>   ] 340 KB / 698.9 KB (48%)  ETA 00:02"
         const percentMatch = line.match(/([0-9]{1,3})%/);
         const bytesMatch = line.match(/([0-9.]+)\s*(B|KB|MB|GB|TB)\s*\/\s*([0-9.]+)\s*(B|KB|MB|GB|TB)/i);
 
         if (percentMatch || bytesMatch) {
-          const percent = percentMatch ? parseInt(percentMatch[1], 10) : undefined;
+          let percent = percentMatch ? parseInt(percentMatch[1], 10) : undefined;
+          if (percent === undefined && bytesMatch) {
+            const currentVal = parseFloat(bytesMatch[1]);
+            const currentUnit = bytesMatch[2].toUpperCase();
+            const totalVal = parseFloat(bytesMatch[3]);
+            const totalUnit = bytesMatch[4].toUpperCase();
+
+            const unitMultiplier = (u: string) =>
+              u === 'TB' ? 1e12 : u === 'GB' ? 1e9 : u === 'MB' ? 1e6 : u === 'KB' ? 1e3 : 1;
+            const currentBytes = currentVal * unitMultiplier(currentUnit);
+            const totalBytes = totalVal * unitMultiplier(totalUnit);
+
+            if (totalBytes > 0) {
+              percent = Math.min(100, Math.round((currentBytes / totalBytes) * 100));
+            }
+          }
+
           broadcastReceive('progress', {
             rawLine: line,
             percent,
@@ -793,6 +842,14 @@ app.post('/api/receive/start', async (req: Request, res: Response) => {
           // Auto-accept: send 'p\r\n' (pair & accept) cleanly to PTY
           try {
             activeReceiveProcess?.stdin?.write('p\r\n');
+            // In case the CLI expects 'y', also send fallback after short delay if needed
+            setTimeout(() => {
+              if (activeReceiveProcess && !activeReceiveProcess.killed) {
+                try {
+                  activeReceiveProcess.stdin?.write('y\r\n');
+                } catch {}
+              }
+            }, 300);
           } catch (err: any) {
             console.error('Failed to write accept to stdin:', err);
           }
@@ -810,7 +867,12 @@ app.post('/api/receive/start', async (req: Request, res: Response) => {
       }
 
       // Check for completed file transfer
-      if (text.includes('You accepted') || text.includes('Completed') || text.includes('100%')) {
+      if (
+        text.includes('Received') ||
+        text.includes('You accepted') ||
+        text.includes('Completed') ||
+        text.includes('100%')
+      ) {
         broadcastReceive('completed', { downloadDir: customDownloadDir });
       }
     });

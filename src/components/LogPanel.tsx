@@ -28,6 +28,18 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClearLogs }) => {
     scrollToBottom();
   }, [logs, scrollToBottom]);
 
+  // Global keyboard shortcut: Ctrl+Shift+C or Alt+C to copy all logs
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'c') || (e.altKey && e.key.toLowerCase() === 'c')) {
+        e.preventDefault();
+        handleCopyLogs();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [logs]);
+
   // Robust clipboard copy with fallback that works on HTTP, remote IPs, and all environments
   const handleCopyLogs = () => {
     if (logs.length === 0) return;
@@ -40,7 +52,7 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClearLogs }) => {
       navigator.clipboard
         .writeText(text)
         .then(() => {
-          triggerCopiedFeedback(`已复制 ${logs.length} 行日志`);
+          triggerCopiedFeedback(`已复制 ${logs.length} 行日志 (快捷键: Ctrl+Shift+C)`);
         })
         .catch(() => {
           fallbackCopy(text);
@@ -152,7 +164,7 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClearLogs }) => {
                 ? 'bg-emerald-900/80 text-emerald-300 border border-emerald-700/80'
                 : 'text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700'
             }`}
-            title="复制全部运行日志到剪贴板"
+            title="复制全部运行日志到剪贴板 (快捷键: Ctrl+Shift+C 或 Alt+C)"
           >
             {copied ? (
               <>
@@ -162,7 +174,7 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClearLogs }) => {
             ) : (
               <>
                 <Copy className="h-3 w-3 text-slate-400" />
-                <span>复制日志</span>
+                <span>复制日志 (Ctrl+Shift+C)</span>
               </>
             )}
           </button>
@@ -206,7 +218,7 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClearLogs }) => {
           ))
         )}
         {/* Scroll anchor that ensures the very last line is never cut off */}
-        <div ref={bottomMarkerRef} className="h-8 shrink-0" />
+        <div ref={bottomMarkerRef} className="h-10 shrink-0" />
       </div>
     </div>
   );
