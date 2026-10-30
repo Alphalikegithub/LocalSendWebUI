@@ -177,6 +177,31 @@ function stopMulticastListener() {
   }
 }
 
+// Force clean any zombie or stale process holding port 53317 on Linux
+function forceReleasePort53317() {
+  stopMulticastListener();
+
+  if (activeReceiveProcess) {
+    try {
+      activeReceiveProcess.kill('SIGKILL');
+    } catch {}
+    activeReceiveProcess = null;
+  }
+  if (activeSendProcess) {
+    try {
+      activeSendProcess.kill('SIGKILL');
+    } catch {}
+    activeSendProcess = null;
+  }
+
+  try {
+    execSync('fuser -k 53317/tcp 53317/udp 2>/dev/null');
+  } catch {}
+  try {
+    execSync('killall -9 localsend-cli 2>/dev/null');
+  } catch {}
+}
+
 // Start temporary UDP listener during discovery
 function startMulticastListener(onDeviceFound?: (dev: DiscoveredDevice) => void) {
   stopMulticastListener();
@@ -506,8 +531,8 @@ app.post('/api/send/start', (req: Request, res: Response) => {
     return res.status(400).json({ error: '没有提供要发送的文件路径' });
   }
 
-  // Stop any background UDP listener to free port 53317
-  stopMulticastListener();
+  // Force clean port 53317 to ensure localsend-cli won't collide with previous processes
+  forceReleasePort53317();
 
   const cli = customCliPath ? { path: customCliPath, found: fs.existsSync(customCliPath) } : resolveCliPath();
 
@@ -620,7 +645,7 @@ app.post('/api/send/cancel', (_req: Request, res: Response) => {
 
 // 6. Seamless Background Receive Mode (No Terminal Needed!)
 app.post('/api/receive/start', (req: Request, res: Response) => {
-  stopMulticastListener();
+  forceReleasePort53317();
 
   const { customCliPath, autoAccept, saveDir } = req.body;
   if (saveDir) {
@@ -637,14 +662,6 @@ app.post('/api/receive/start', (req: Request, res: Response) => {
     return res.status(404).json({
       error: `未找到 localsend-cli 可执行文件（${cli.path}），请在设置中指定。`,
     });
-  }
-
-  // Terminate previous receiver if running
-  if (activeReceiveProcess) {
-    try {
-      activeReceiveProcess.kill('SIGTERM');
-    } catch {}
-    activeReceiveProcess = null;
   }
 
   try {
@@ -665,6 +682,14 @@ app.post('/api/receive/start', (req: Request, res: Response) => {
       const lines = text.split(/\r?\n/).filter(Boolean);
       for (const line of lines) {
         broadcastReceive('log', { message: line, level: 'info' });
+      }
+
+      // Check for IPv6 link-local connection abort
+      if (text.includes('os error 103') || text.includes('RsHttpClientError')) {
+        broadcastReceive('log', {
+          message: '【传输中断诊断】检测到连接被系统中止 (os error 103)。这通常是因为发送方使用了 IPv6 Link-Local (fe80::) 路由失败。请在发送方手机 LocalSend 设置中选择“仅使用 IPv4”，或在发送方手动输入电脑的 IPv4 地址发送。',
+          level: 'warn',
+        });
       }
 
       // Check if CLI is prompting: "Accept? Y/N/P"
