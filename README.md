@@ -8,19 +8,15 @@ Originally built in C++ with Qt, migrated to a modern high-performance React + T
 
 应用已升级为 **Full-Stack Node.js (Express + Vite)** 真实本地执行架构，不再是前端纯模拟：
 
-- **真实的底层 CLI 调用 (Real localsend-cli execution)**:
-  - 自动寻找本地已安装或编译的 `localsend-cli`（包括 `/data/QtProjects/localsend/target/debug/localsend-cli`、`~/.local/bin/localsend-cli` 等）。
-  - 支持通过环境变量 `LOCALSEND_CLI` 或在“设置”中手动配置 CLI 绝对路径。
-  - 发送时直接调用 `localsend-cli send --to <target> <files>`，通过实时流将 CLI 标准输出、ETA 进度以及终端状态实时回传前端。
-  - 点击“接收”可直接调起本机终端（xterm / gnome-terminal / mate-terminal 等）或后台启动 `localsend-cli`。
+- **真实的无缝后台接收 (Seamless Background Receive, No Terminal Needed)**:
+  - 后台静默启动 `localsend-cli` 并接管标准输入输出，**完全无需弹出外部系统终端，也无需在终端中敲键盘输入 Y/N 确认**。
+  - 默认开启**自动接受传输 (Auto-Accept)**，或在 Web 界面中直接弹出友好的接收确认弹窗，一键点击“接受 (Y)”或“拒绝 (N)”。
+  - 接收文件统一自动保存至标准的系统下载目录：`~/Downloads/LocalSend`（支持一键点击“在文件夹中打开”调用系统文件管理器，或直接在网页中下载）。
 
-- **真实的 TLS 身份与证书指纹 (Real TLS Identity & Fingerprint)**:
-  - 自动读取 `~/.config/localsend-cli/identity.pem`，使用 Node.js Crypto 解析 X.509 证书并提取 SHA-256 唯一指纹。
-
-- **真实的网络设备探测 (Real Multicast & Subnet Probing)**:
-  - 通过 Node.js `dgram` 原生绑定端口 `53317`，加入组播组 `224.0.0.167` 监听局域网 LocalSend 广播。
-  - 自动读取网卡 IPv4 网段（如 `192.168.118.0/24`），并发探测该网段内 253 个局域网地址的 `/api/localsend/v2/info`。
-  - 局域网设备（如“富有的椰子 (192.168.118.115)”）一旦在线立即显示并可直接点击发送。
+- **极速局域网设备探测 (Rapid Multicast & Subnet Probing)**:
+  - 双重广播握手：向 `224.0.0.167:53317` 发送组播握手包，局域网活动设备毫秒级自报家门。
+  - 80 线程高并发扫描与已发现设备优先缓存：探测超时优化至 500ms，全网段扫描从 15 秒缩减至 1~2 秒。
+  - 携带 `identity.pem` 的 mTLS 客户端双向认证，严格符合 LocalSend v2 安全协议。
 
 - **待发送文件与目录管理 (Pending Files & Directory Management)**:
   - Drag-and-drop file and folder dropping
@@ -30,13 +26,7 @@ Originally built in C++ with Qt, migrated to a modern high-performance React + T
 - **传输控制与实时进度 (Transfer Controls & Real-Time Progress)**:
   - Full progress tracking: percentage, transmitted / total size, transfer speed (MB/s), and ETA countdown
   - Send cancellation support
-  - Realistic chunked transmission pipeline
-
-- **接收模式 (Receive Mode)**:
-  - Server listener on port 53317
-  - Local direct connection QR/pairing info
-  - Incoming transfer confirmation dialog (Accept / Decline)
-  - Simulated incoming transfer triggers for testing
+  - 智能 IP 校验与修正（防止误输入多余网段）
 
 - **日志控制台 (Terminal Logs)**:
   - Timestamped real-time log stream mirroring Qt `QPlainTextEdit`

@@ -427,6 +427,66 @@ export function App() {
     }
   };
 
+  const [downloadDir, setDownloadDir] = useState<string>('/home/user/Downloads/LocalSend');
+  const [autoAccept, setAutoAccept] = useState<boolean>(true);
+
+  // Subscribe to receive mode events
+  useEffect(() => {
+    const es = new EventSource('/api/receive/stream');
+    es.addEventListener('log', (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        appendLog(data.message, data.level || 'info');
+      } catch {}
+    });
+
+    es.addEventListener('prompt', (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        const newPrompt: ReceivedTransfer = {
+          id: data.id,
+          senderAlias: data.sender || '局域网设备',
+          senderIp: '',
+          timestamp: getCurrentTimestamp(),
+          files: [{ name: `传输文件 (共 ${data.fileCount} 项)`, size: 0, type: 'file' }],
+          totalSize: 0,
+          status: 'pending',
+        };
+        setPendingTransfers((prev) => [newPrompt, ...prev]);
+        setShowReceiveModal(true);
+        appendLog(`收到来自【${data.sender}】的文件传输请求，请确认是否接收。`, 'warn');
+      } catch {}
+    });
+
+    es.addEventListener('completed', (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        appendLog(`文件传输已顺利完成！文件保存在: ${data.downloadDir}`, 'success');
+        fetch('/api/receive/files')
+          .then((r) => r.json())
+          .then((filesData) => {
+            if (filesData.files && filesData.files.length > 0) {
+              const topFile = filesData.files[0];
+              setTransferHistory((prev) => [
+                {
+                  id: `recv-${Date.now()}`,
+                  senderAlias: '局域网设备',
+                  senderIp: 'LocalSend',
+                  timestamp: getCurrentTimestamp(),
+                  files: [topFile],
+                  totalSize: topFile.size,
+                  status: 'completed',
+                },
+                ...prev,
+              ]);
+            }
+          });
+      } catch {}
+    });
+
+    return () => es.close();
+  }, []);
+
   // 5. Cancel send
   const handleCancelSend = async () => {
     appendLog('正在取消发送…', 'warn');
@@ -439,24 +499,45 @@ export function App() {
     }
   };
 
-  // 6. Receive mode - triggers real CLI receiver on the host machine
+  // 6. Seamless background receive mode (no terminal needed)
   const handleOpenReceive = async () => {
     setShowReceiveModal(true);
     try {
       const res = await fetch('/api/receive/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ customCliPath: settings.cliPath }),
+        body: JSON.stringify({
+          customCliPath: settings.cliPath,
+          autoAccept,
+          saveDir: downloadDir,
+        }),
       });
       const data = await res.json();
       if (res.ok) {
+        if (data.downloadDir) {
+          setDownloadDir(data.downloadDir);
+        }
         appendLog(data.message, 'success');
-        appendLog('接收文件会保存到 CLI 的默认下载目录；在终端中按 Ctrl+C 可结束接收。');
       } else {
         appendLog(`无法启动接收模式：${data.error}`, 'error');
       }
     } catch (err: any) {
       appendLog(`启动接收模式失败: ${err.message}`, 'error');
+    }
+  };
+
+  const handleOpenFolder = async () => {
+    try {
+      const res = await fetch('/api/open-folder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dir: downloadDir }),
+      });
+      if (res.ok) {
+        appendLog(`已在系统文件管理器中打开保存目录: ${downloadDir}`, 'info');
+      }
+    } catch (err: any) {
+      appendLog(`打开文件夹失败: ${err.message}`, 'error');
     }
   };
 
@@ -468,34 +549,54 @@ export function App() {
       timestamp: getCurrentTimestamp(),
       files: [
         {
-          name: 'WorkReport_2026.docx',
-          size: 4521090,
-          type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          name: 'VID20260627073253.mp4',
+          size: 135371366,
+          type: 'video/mp4',
         },
       ],
-      totalSize: 4521090,
+      totalSize: 135371366,
       status: 'pending',
     };
 
     setPendingTransfers((prev) => [dummyReq, ...prev]);
     setShowReceiveModal(true);
-    appendLog(`收到来自 富有的椰子 (192.168.118.115) 的文件传输请求（共 1 个文件，合计 ${formatBytes(dummyReq.totalSize)}）。`, 'warn');
+    appendLog(`收到来自 富有的椰子 (192.168.118.115) 的文件传输请求（VID20260627073253.mp4，129.1 MB）。`, 'warn');
   };
 
-  const handleAcceptTransfer = (id: string) => {
+  const handleAcceptTransfer = async (id: string) => {
     const req = pendingTransfers.find((t) => t.id === id);
-    if (!req) return;
-
     setPendingTransfers((prev) => prev.filter((t) => t.id !== id));
-    setTransferHistory((prev) => [{ ...req, status: 'completed' }, ...prev]);
-    appendLog(`已接受并成功接收来自 ${req.senderAlias} 的 ${req.files.length} 个文件！`, 'success');
+
+    try {
+      await fetch('/api/receive/respond', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'y' }),
+      });
+      appendLog('已在界面中确认接受传输请求！', 'success');
+      if (req) {
+        setTransferHistory((prev) => [{ ...req, status: 'completed' }, ...prev]);
+      }
+    } catch (err: any) {
+      appendLog(`确认接收异常: ${err.message}`, 'error');
+    }
   };
 
-  const handleDeclineTransfer = (id: string) => {
+  const handleDeclineTransfer = async (id: string) => {
     const req = pendingTransfers.find((t) => t.id === id);
     setPendingTransfers((prev) => prev.filter((t) => t.id !== id));
-    if (req) {
-      appendLog(`已拒绝来自 ${req.senderAlias} (${req.senderIp}) 的传输请求。`, 'warn');
+
+    try {
+      await fetch('/api/receive/respond', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'n' }),
+      });
+      if (req) {
+        appendLog(`已在界面中拒绝来自 ${req.senderAlias} 的传输请求。`, 'warn');
+      }
+    } catch (err: any) {
+      appendLog(`拒绝传输异常: ${err.message}`, 'error');
     }
   };
 
@@ -569,9 +670,13 @@ export function App() {
         isOpen={showReceiveModal}
         onClose={() => setShowReceiveModal(false)}
         settings={settings}
+        downloadDir={downloadDir}
+        autoAccept={autoAccept}
+        onToggleAutoAccept={setAutoAccept}
         pendingTransfers={pendingTransfers}
         onAcceptTransfer={handleAcceptTransfer}
         onDeclineTransfer={handleDeclineTransfer}
+        onOpenFolder={handleOpenFolder}
       />
 
       <HistoryDrawer

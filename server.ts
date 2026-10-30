@@ -24,16 +24,21 @@ app.use(express.json());
 
 // Directories for temp file uploads and downloaded files
 const uploadDir = path.join(os.tmpdir(), 'localsend-gui-uploads');
-const downloadDir = path.join(os.homedir(), 'Downloads', 'LocalSend');
+let customDownloadDir = path.join(os.homedir(), 'Downloads', 'LocalSend');
 
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
+function ensureDirectories() {
+  if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+  }
+  if (!fs.existsSync(customDownloadDir)) {
+    try {
+      fs.mkdirSync(customDownloadDir, { recursive: true });
+    } catch {}
+  }
 }
-if (!fs.existsSync(downloadDir)) {
-  fs.mkdirSync(downloadDir, { recursive: true });
-}
+ensureDirectories();
 
-// Multer storage for incoming files
+// Multer storage for files to send
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
     cb(null, uploadDir);
@@ -59,7 +64,12 @@ interface DiscoveredDevice {
 
 let activeSendProcess: ChildProcess | null = null;
 let activeReceiveProcess: ChildProcess | null = null;
+let receiveAutoAccept = true;
+let receiveStdoutBuffer = '';
+const receiveSubscribers = new Set<(event: string, data: any) => void>();
+
 const discoveredDevices = new Map<string, DiscoveredDevice>();
+const knownIpsCache = new Set<string>(); // Cache for ultra-fast refreshes
 let multicastSocket: dgram.Socket | null = null;
 
 // Helper: resolve localsend-cli executable
@@ -154,7 +164,7 @@ function getLocalIPv4Addresses(): { ip: string; netmask: string; name: string }[
   return list;
 }
 
-// Safely close and release UDP port 53317
+// Release UDP socket on port 53317
 function stopMulticastListener() {
   if (multicastSocket) {
     try {
@@ -167,7 +177,7 @@ function stopMulticastListener() {
   }
 }
 
-// Start temporary UDP listener for discovery
+// Start temporary UDP listener during discovery
 function startMulticastListener(onDeviceFound?: (dev: DiscoveredDevice) => void) {
   stopMulticastListener();
 
@@ -204,6 +214,7 @@ function startMulticastListener(onDeviceFound?: (dev: DiscoveredDevice) => void)
         };
 
         discoveredDevices.set(rinfo.address, dev);
+        knownIpsCache.add(rinfo.address);
         if (onDeviceFound) {
           onDeviceFound(dev);
         }
@@ -214,28 +225,42 @@ function startMulticastListener(onDeviceFound?: (dev: DiscoveredDevice) => void)
       try {
         multicastSocket?.addMembership(MULTICAST_GROUP);
 
-        // Send multicast discovery announcement so peers on LAN reply
-        const identity = resolveIdentity();
-        const announceMsg = Buffer.from(
-          JSON.stringify({
-            alias: os.hostname(),
-            version: '2.1',
-            deviceModel: 'Linux Desktop',
-            deviceType: 'desktop',
-            fingerprint: identity.fingerprint,
-            port: LOCALSEND_PORT,
-            protocol: 'https',
-            download: true,
-            announce: true,
-          })
-        );
-        multicastSocket?.send(announceMsg, 0, announceMsg.length, LOCALSEND_PORT, MULTICAST_GROUP);
+        // Send multicast announce packet
+        const sendAnnounce = () => {
+          const identity = resolveIdentity();
+          const announceMsg = Buffer.from(
+            JSON.stringify({
+              alias: os.hostname(),
+              version: '2.1',
+              deviceModel: 'Linux Desktop',
+              deviceType: 'desktop',
+              fingerprint: identity.fingerprint,
+              port: LOCALSEND_PORT,
+              protocol: 'https',
+              download: true,
+              announce: true,
+            })
+          );
+          multicastSocket?.send(announceMsg, 0, announceMsg.length, LOCALSEND_PORT, MULTICAST_GROUP);
+        };
+
+        sendAnnounce();
+        setTimeout(sendAnnounce, 250); // repeat once for Wi-Fi reliability
       } catch (err: any) {
         console.warn('Multicast membership error:', err.message);
       }
     });
   } catch (err: any) {
     console.warn('Could not bind UDP discovery socket:', err.message);
+  }
+}
+
+// Broadcast helper for receive mode SSE subscribers
+function broadcastReceive(event: string, data: any) {
+  for (const subscriber of receiveSubscribers) {
+    try {
+      subscriber(event, data);
+    } catch {}
   }
 }
 
@@ -258,10 +283,12 @@ app.get('/api/system/status', (_req: Request, res: Response) => {
     hostname: os.hostname(),
     localAddresses: localIps,
     port: LOCALSEND_PORT,
+    downloadDir: customDownloadDir,
+    isReceiving: activeReceiveProcess !== null,
   });
 });
 
-// 2. Discover devices (mTLS HTTPS + HTTP probe + UDP announce)
+// 2. Discover devices (High speed + mTLS client cert + UDP multicast)
 app.get('/api/discover/stream', async (req: Request, res: Response) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -276,7 +303,6 @@ app.get('/api/discover/stream', async (req: Request, res: Response) => {
   const identity = resolveIdentity();
   sendEvent('log', { message: '开始发现设备（组播监听 + 本网段扫描）…', level: 'info' });
 
-  // Get local interfaces
   const localAddresses = getLocalIPv4Addresses();
   if (localAddresses.length === 0) {
     sendEvent('log', { message: '未找到可扫描的 IPv4 局域网地址，仅监听组播广播。', level: 'warn' });
@@ -285,48 +311,55 @@ app.get('/api/discover/stream', async (req: Request, res: Response) => {
     return;
   }
 
-  // Calculate subnet IPs to probe
-  const ipsToProbe: string[] = [];
+  // Calculate subnet IPs, prioritizing previously known cached IPs
+  const ipsToProbeSet = new Set<string>();
+
+  // Add cached IPs first so they are checked immediately
+  for (const cachedIp of knownIpsCache) {
+    ipsToProbeSet.add(cachedIp);
+  }
+
   for (const iface of localAddresses) {
     const parts = iface.ip.split('.').map(Number);
     if (parts.length === 4) {
       const prefix = `${parts[0]}.${parts[1]}.${parts[2]}`;
       for (let host = 1; host <= 254; host++) {
         if (host !== parts[3]) {
-          ipsToProbe.push(`${prefix}.${host}`);
+          ipsToProbeSet.add(`${prefix}.${host}`);
         }
       }
     }
   }
 
+  const ipsToProbe = Array.from(ipsToProbeSet);
   sendEvent('log', { message: `正在探测 ${ipsToProbe.length} 个局域网地址…`, level: 'info' });
 
-  // Start multicast listener during discovery
+  // Start temporary UDP listener
   startMulticastListener((dev) => {
     sendEvent('device', dev);
     sendEvent('log', { message: `发现设备：${dev.alias} (${dev.ip})`, level: 'success' });
   });
 
-  // HTTPS agent with mTLS client certificate and key (CRITICAL for LocalSend v2 handshake)
+  // HTTPS agent with mTLS client certificate and key (strictly required by LocalSend v2)
   const httpsAgent = new https.Agent({
     rejectUnauthorized: false,
     cert: identity.pem || undefined,
     key: identity.pem || undefined,
-    timeout: 1200,
+    timeout: 500, // Reduced from 1200ms to 500ms for fast LAN scanning
     keepAlive: false,
   });
 
   const httpAgent = new http.Agent({
-    timeout: 1000,
+    timeout: 400,
     keepAlive: false,
   });
 
   const probeIp = async (ip: string): Promise<void> => {
     return new Promise((resolve) => {
-      // Step A: Try HTTPS mTLS
+      // Step A: HTTPS with mTLS
       const reqHttps = https.get(
         `https://${ip}:${LOCALSEND_PORT}/api/localsend/v2/info`,
-        { agent: httpsAgent, timeout: 1200 },
+        { agent: httpsAgent, timeout: 500 },
         (response) => {
           let body = '';
           response.on('data', (chunk) => (body += chunk));
@@ -346,6 +379,7 @@ app.get('/api/discover/stream', async (req: Request, res: Response) => {
                   lastSeen: Date.now(),
                 };
                 discoveredDevices.set(ip, dev);
+                knownIpsCache.add(ip);
                 sendEvent('device', dev);
                 sendEvent('log', { message: `发现设备：${dev.alias} (${ip})`, level: 'success' });
                 return resolve();
@@ -357,10 +391,10 @@ app.get('/api/discover/stream', async (req: Request, res: Response) => {
       );
 
       reqHttps.on('error', () => {
-        // Step B: Fallback to plain HTTP if peer has encryption disabled
+        // Step B: HTTP fallback
         const reqHttp = http.get(
           `http://${ip}:${LOCALSEND_PORT}/api/localsend/v2/info`,
-          { agent: httpAgent, timeout: 1000 },
+          { agent: httpAgent, timeout: 400 },
           (response) => {
             let body = '';
             response.on('data', (chunk) => (body += chunk));
@@ -380,6 +414,7 @@ app.get('/api/discover/stream', async (req: Request, res: Response) => {
                     lastSeen: Date.now(),
                   };
                   discoveredDevices.set(ip, dev);
+                  knownIpsCache.add(ip);
                   sendEvent('device', dev);
                   sendEvent('log', { message: `发现设备：${dev.alias} (${ip})`, level: 'success' });
                 }
@@ -402,8 +437,8 @@ app.get('/api/discover/stream', async (req: Request, res: Response) => {
     });
   };
 
-  // Run probes concurrently
-  const concurrency = 40;
+  // Increased concurrency to 80 for rapid execution
+  const concurrency = 80;
   let activeIndex = 0;
 
   const runWorker = async () => {
@@ -416,7 +451,7 @@ app.get('/api/discover/stream', async (req: Request, res: Response) => {
   const workers = Array.from({ length: concurrency }, () => runWorker());
   await Promise.all(workers);
 
-  // Discovery window finish: release UDP port 53317 immediately
+  // Close UDP port 53317 immediately so send/receive won't collide
   stopMulticastListener();
 
   const foundCount = discoveredDevices.size;
@@ -460,21 +495,18 @@ app.post('/api/send/start', (req: Request, res: Response) => {
     return res.status(400).json({ error: '缺少目标设备或 IP 地址' });
   }
 
-  // Sanitize target IP if user typed a malformed IP with duplicate octet (e.g. 192.168.1.118.115 -> 192.168.118.115)
+  // Auto-clean malformed 5-segment IPs (e.g., 192.168.1.118.115 -> 192.168.118.115)
   target = target.trim();
   const octets = target.split('.');
-  if (octets.length > 4) {
-    // If user accidentally typed 192.168.1.118.115, auto-fix to 192.168.118.115
-    if (octets[0] === '192' && octets[1] === '168' && octets.length === 5) {
-      target = `${octets[0]}.${octets[1]}.${octets[3]}.${octets[4]}`;
-    }
+  if (octets.length === 5 && octets[0] === '192' && octets[1] === '168') {
+    target = `192.168.${octets[3]}.${octets[4]}`;
   }
 
   if (!filePaths || !Array.isArray(filePaths) || filePaths.length === 0) {
     return res.status(400).json({ error: '没有提供要发送的文件路径' });
   }
 
-  // CRITICAL: Release port 53317 before spawning localsend-cli
+  // Stop any background UDP listener to free port 53317
   stopMulticastListener();
 
   const cli = customCliPath ? { path: customCliPath, found: fs.existsSync(customCliPath) } : resolveCliPath();
@@ -496,7 +528,7 @@ app.post('/api/send/start', (req: Request, res: Response) => {
 
   if (!cli.found && !fs.existsSync(cli.path)) {
     sendEvent('log', {
-      message: `未找到 localsend-cli 可执行文件（${cli.path}），无法启动底层发送进程。请在“设置”中配置正确的 CLI 路径。`,
+      message: `未找到 localsend-cli 可执行文件（${cli.path}），无法启动底层发送进程。`,
       level: 'error',
     });
     sendEvent('status', { status: 'error', error: 'CLI binary not found' });
@@ -586,12 +618,19 @@ app.post('/api/send/cancel', (_req: Request, res: Response) => {
   res.json({ success: true, message: '没有正在执行的发送任务' });
 });
 
-// 6. Launch CLI Receive mode
+// 6. Seamless Background Receive Mode (No Terminal Needed!)
 app.post('/api/receive/start', (req: Request, res: Response) => {
-  // CRITICAL: Release port 53317 before spawning receive
   stopMulticastListener();
 
-  const { customCliPath } = req.body;
+  const { customCliPath, autoAccept, saveDir } = req.body;
+  if (saveDir) {
+    customDownloadDir = saveDir;
+    ensureDirectories();
+  }
+  if (typeof autoAccept === 'boolean') {
+    receiveAutoAccept = autoAccept;
+  }
+
   const cli = customCliPath ? { path: customCliPath, found: fs.existsSync(customCliPath) } : resolveCliPath();
 
   if (!cli.found && !fs.existsSync(cli.path)) {
@@ -600,70 +639,205 @@ app.post('/api/receive/start', (req: Request, res: Response) => {
     });
   }
 
-  const terminalCandidates = [
-    { program: 'x-terminal-emulator', flag: '-e' },
-    { program: 'mate-terminal', flag: '-x' },
-    { program: 'ukui-terminal', flag: '-e' },
-    { program: 'deepin-terminal', flag: '-e' },
-    { program: 'qterminal', flag: '-e' },
-    { program: 'konsole', flag: '-e' },
-    { program: 'xfce4-terminal', flag: '-x' },
-    { program: 'gnome-terminal', flag: '--' },
-    { program: 'xterm', flag: '-e' },
-  ];
-
-  let terminalPath = '';
-  let terminalFlag = '';
-
-  for (const t of terminalCandidates) {
+  // Terminate previous receiver if running
+  if (activeReceiveProcess) {
     try {
-      const out = execSync(`which ${t.program} 2>/dev/null`, { encoding: 'utf8' }).trim();
-      if (out && fs.existsSync(out)) {
-        terminalPath = out;
-        terminalFlag = t.flag;
-        break;
-      }
+      activeReceiveProcess.kill('SIGTERM');
     } catch {}
-  }
-
-  if (terminalPath) {
-    const cmd = `${cli.path}; code=$?; echo; echo "LocalSend CLI 已退出（退出码 $code）"; read -r -p "按回车键关闭窗口…" _`;
-    try {
-      const p = spawn(terminalPath, [terminalFlag, '/bin/bash', '-c', cmd], {
-        detached: true,
-        stdio: 'ignore',
-      });
-      p.unref();
-      return res.json({
-        success: true,
-        mode: 'terminal',
-        terminal: terminalPath,
-        cliPath: cli.path,
-        message: `已在系统终端中启动接收模式（CLI: ${cli.path}）。`,
-      });
-    } catch (err: any) {
-      console.warn('Failed to spawn terminal, falling back to background spawn:', err.message);
-    }
+    activeReceiveProcess = null;
   }
 
   try {
-    if (activeReceiveProcess) {
-      activeReceiveProcess.kill();
-    }
+    receiveStdoutBuffer = '';
+
+    // Spawn localsend-cli directly in the download directory with piped stdin/stdout
     activeReceiveProcess = spawn(cli.path, [], {
-      cwd: downloadDir,
-      detached: true,
+      cwd: customDownloadDir,
+      env: { ...process.env },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    activeReceiveProcess.stdout?.on('data', (data) => {
+      const text = data.toString('utf8');
+      receiveStdoutBuffer += text;
+
+      // Broadcast raw log lines to UI
+      const lines = text.split(/\r?\n/).filter(Boolean);
+      for (const line of lines) {
+        broadcastReceive('log', { message: line, level: 'info' });
+      }
+
+      // Check if CLI is prompting: "Accept? Y/N/P"
+      if (receiveStdoutBuffer.includes('Accept? Y/N/P') || receiveStdoutBuffer.includes('Accept?')) {
+        // Parse sender & file info
+        const senderMatch = receiveStdoutBuffer.match(/R\s+([^\r\n]+)/);
+        const filesMatch = receiveStdoutBuffer.match(/Files\s*\(([0-9]+)[^:]*\):/i);
+        const senderName = senderMatch ? senderMatch[1].trim() : '局域网设备';
+        const fileCount = filesMatch ? parseInt(filesMatch[1]) : 1;
+
+        const promptData = {
+          id: `prompt-${Date.now()}`,
+          sender: senderName,
+          fileCount,
+          rawText: receiveStdoutBuffer,
+          downloadDir: customDownloadDir,
+        };
+
+        if (receiveAutoAccept) {
+          // Auto-accept directly!
+          activeReceiveProcess?.stdin?.write('y\n');
+          broadcastReceive('log', {
+            message: `【自动接收已触发】已自动接受来自 ${senderName} 的文件传输请求。`,
+            level: 'success',
+          });
+        } else {
+          // Push popup prompt event to UI
+          broadcastReceive('prompt', promptData);
+        }
+
+        receiveStdoutBuffer = '';
+      }
+
+      // Check for completed file transfer
+      if (text.includes('You accepted') || text.includes('Completed') || text.includes('100%')) {
+        broadcastReceive('completed', { downloadDir: customDownloadDir });
+      }
+    });
+
+    activeReceiveProcess.stderr?.on('data', (data) => {
+      const errLine = data.toString('utf8').trim();
+      if (errLine) {
+        broadcastReceive('log', { message: errLine, level: 'warn' });
+      }
+    });
+
+    activeReceiveProcess.on('close', (code) => {
+      activeReceiveProcess = null;
+      broadcastReceive('log', {
+        message: `接收服务已停止（退出码 ${code}）。`,
+        level: code === 0 ? 'info' : 'warn',
+      });
+      broadcastReceive('status', { running: false });
     });
 
     res.json({
       success: true,
-      mode: 'background',
-      cliPath: cli.path,
-      message: `已在后台启动接收模式（CLI: ${cli.path}），文件将保存至 ${downloadDir}`,
+      downloadDir: customDownloadDir,
+      autoAccept: receiveAutoAccept,
+      message: `接收模式已无缝启动！接收文件将直接保存至: ${customDownloadDir}`,
     });
   } catch (err: any) {
     res.status(500).json({ error: `无法启动接收进程: ${err.message}` });
   }
+});
+
+// 7. User responds to incoming transfer prompt right in the web UI
+app.post('/api/receive/respond', (req: Request, res: Response) => {
+  const { action } = req.body; // 'y' (accept), 'n' (decline), 'p' (pair)
+  if (!activeReceiveProcess || !activeReceiveProcess.stdin) {
+    return res.status(400).json({ error: '当前没有正在运行的接收进程' });
+  }
+
+  const choice = (action || 'y').toLowerCase();
+  activeReceiveProcess.stdin.write(`${choice}\n`);
+
+  broadcastReceive('log', {
+    message: choice === 'y' || choice === 'p' ? '已确认接受文件传输。' : '已拒绝文件传输请求。',
+    level: choice === 'y' || choice === 'p' ? 'success' : 'warn',
+  });
+
+  res.json({ success: true, action: choice });
+});
+
+// 8. Stop receiving
+app.post('/api/receive/stop', (_req: Request, res: Response) => {
+  if (activeReceiveProcess) {
+    try {
+      activeReceiveProcess.kill('SIGTERM');
+    } catch {}
+    activeReceiveProcess = null;
+  }
+  res.json({ success: true, message: '接收服务已停止' });
+});
+
+// 9. SSE stream for receive logs and prompts
+app.get('/api/receive/stream', (req: Request, res: Response) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+
+  const subscriber = (event: string, data: any) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
+  receiveSubscribers.add(subscriber);
+
+  // Initial status
+  subscriber('status', {
+    running: activeReceiveProcess !== null,
+    downloadDir: customDownloadDir,
+    autoAccept: receiveAutoAccept,
+  });
+
+  req.on('close', () => {
+    receiveSubscribers.delete(subscriber);
+  });
+});
+
+// 10. List downloaded files
+app.get('/api/receive/files', (_req: Request, res: Response) => {
+  ensureDirectories();
+  try {
+    const list = fs.readdirSync(customDownloadDir).filter((f) => !f.startsWith('.'));
+    const files = list.map((f) => {
+      const fullPath = path.join(customDownloadDir, f);
+      const stat = fs.statSync(fullPath);
+      return {
+        name: f,
+        size: stat.size,
+        isDir: stat.isDirectory(),
+        mtime: stat.mtimeMs,
+        path: fullPath,
+      };
+    });
+    files.sort((a, b) => b.mtime - a.mtime);
+    res.json({ downloadDir: customDownloadDir, files });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 11. Open download directory in system file manager (xdg-open / explorer / open)
+app.post('/api/open-folder', (req: Request, res: Response) => {
+  ensureDirectories();
+  const dirToOpen = req.body.dir || customDownloadDir;
+
+  try {
+    if (process.platform === 'win32') {
+      spawn('explorer', [dirToOpen], { detached: true, stdio: 'ignore' });
+    } else if (process.platform === 'darwin') {
+      spawn('open', [dirToOpen], { detached: true, stdio: 'ignore' });
+    } else {
+      spawn('xdg-open', [dirToOpen], { detached: true, stdio: 'ignore' });
+    }
+    res.json({ success: true, opened: dirToOpen });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 12. Direct browser download of any received file
+app.get('/api/download-file/:filename', (req: Request, res: Response) => {
+  const filename = req.params.filename;
+  const filePath = path.join(customDownloadDir, filename);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: '文件不存在' });
+  }
+
+  res.download(filePath, filename);
 });
 
 // ==========================================
@@ -698,6 +872,7 @@ async function startServer() {
         console.log(`  同局域网访问地址:   http://${iface.ip}:${PORT}  (${iface.name})`);
       });
     }
+    console.log(`  接收文件保存目录:   ${customDownloadDir}`);
     console.log('=============================================================\n');
   });
 }
