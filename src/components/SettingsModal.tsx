@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { X, Shield, Terminal, Save, RotateCcw, Key } from 'lucide-react';
+import { X, Shield, Terminal, Save, RotateCcw, Key, Monitor, Check } from 'lucide-react';
 import { AppSettings } from '../types';
 import { generateFingerprint } from '../utils/format';
 
@@ -15,6 +15,26 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onClose,
 }) => {
   const [form, setForm] = useState<AppSettings>({ ...settings });
+  const [creatingShortcut, setCreatingShortcut] = useState(false);
+  const [shortcutMsg, setShortcutMsg] = useState<string | null>(null);
+
+  const handleCreateDesktopShortcut = async () => {
+    setCreatingShortcut(true);
+    setShortcutMsg(null);
+    try {
+      const res = await fetch('/api/system/create-desktop-shortcut', { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        setShortcutMsg(data.message || '已成功在【/home/user/桌面】创建快捷方式！');
+      } else {
+        setShortcutMsg(data.error || '创建失败，请在终端执行 bash ./install-desktop.sh');
+      }
+    } catch (err: any) {
+      setShortcutMsg(`执行异常: ${err.message}`);
+    } finally {
+      setCreatingShortcut(false);
+    }
+  };
 
   const handleRegenerateFingerprint = () => {
     setForm({
@@ -146,6 +166,34 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <span className="text-[11px] text-slate-400">
               可配置系统安装的 localsend-cli 路径或使用内置 Web Engine。
             </span>
+          </div>
+
+          {/* Desktop Launcher Section */}
+          <div className="p-3 bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800/60 rounded-lg space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="font-semibold text-sky-900 dark:text-sky-200 flex items-center gap-1.5">
+                <Monitor className="h-4 w-4 text-sky-600" />
+                <span>桌面一键启动快捷方式 (/home/user/桌面)</span>
+              </span>
+              <button
+                type="button"
+                disabled={creatingShortcut}
+                onClick={handleCreateDesktopShortcut}
+                className="px-2.5 py-1 bg-sky-600 hover:bg-sky-700 text-white rounded text-xs font-semibold flex items-center gap-1 transition-colors shadow-2xs disabled:opacity-50"
+              >
+                <Monitor className="h-3.5 w-3.5" />
+                <span>{creatingShortcut ? '正在创建…' : '一键生成桌面图标'}</span>
+              </button>
+            </div>
+            <p className="text-[11px] text-sky-800 dark:text-sky-300 leading-relaxed">
+              在您的系统桌面生成 <strong>LocalSend GUI.desktop</strong> 图标。双击桌面图标即可后台自动拉起全栈服务并唤起独立应用窗口，完美契合生产环境日常使用！
+            </p>
+            {shortcutMsg && (
+              <div className="text-[11px] p-2 bg-white dark:bg-slate-900 rounded border border-sky-300 dark:border-sky-700 text-sky-900 dark:text-sky-200 flex items-center gap-1.5 animate-fade-in font-medium">
+                <Check className="h-3.5 w-3.5 text-emerald-600 shrink-0" />
+                <span>{shortcutMsg}</span>
+              </div>
+            )}
           </div>
 
           <div className="flex items-center justify-between pt-3 border-t border-slate-200 dark:border-slate-700">

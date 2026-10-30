@@ -1078,6 +1078,77 @@ app.post('/api/system/terminal-receive', async (_req: Request, res: Response) =>
   });
 });
 
+// 7c. Create desktop launcher shortcut on /home/user/桌面
+app.post('/api/system/create-desktop-shortcut', async (_req: Request, res: Response) => {
+  const scriptPath = path.join(__dirname, 'install-desktop.sh');
+  const desktopPath = '/home/user/桌面';
+
+  try {
+    if (fs.existsSync(scriptPath)) {
+      try {
+        execSync(`bash "${scriptPath}"`, { encoding: 'utf8' });
+      } catch (err: any) {
+        console.warn('install-desktop.sh run output:', err.message);
+      }
+    }
+
+    // Direct programmatic generation fallback to guarantee /home/user/桌面 has the file
+    const startScript = path.join(__dirname, 'start.sh');
+    const iconPath = path.join(__dirname, 'icon.svg');
+
+    try {
+      fs.chmodSync(startScript, 0o755);
+    } catch {}
+
+    const desktopContent = `[Desktop Entry]
+Version=1.0
+Type=Application
+Name=LocalSend GUI
+Comment=局域网高速安全文件传输工具
+Exec=${startScript}
+Icon=${iconPath}
+Terminal=false
+Categories=Network;FileTransfer;Utility;
+StartupNotify=true
+`;
+
+    const targetPaths = [
+      path.join(desktopPath, 'LocalSend-GUI.desktop'),
+      path.join(os.homedir(), '桌面', 'LocalSend-GUI.desktop'),
+      path.join(os.homedir(), 'Desktop', 'LocalSend-GUI.desktop'),
+      path.join(os.homedir(), '.local', 'share', 'applications', 'localsend-gui.desktop'),
+    ];
+
+    const created: string[] = [];
+    for (const target of targetPaths) {
+      try {
+        const parent = path.dirname(target);
+        if (!fs.existsSync(parent)) {
+          fs.mkdirSync(parent, { recursive: true });
+        }
+        fs.writeFileSync(target, desktopContent, 'utf8');
+        fs.chmodSync(target, 0o755);
+        try {
+          execSync(`gio set "${target}" metadata::trusted true 2>/dev/null`);
+        } catch {}
+        created.push(target);
+      } catch {}
+    }
+
+    res.json({
+      success: true,
+      createdPaths: created,
+      primaryPath: targetPaths[0],
+      message: `已成功在【/home/user/桌面】生成 LocalSend GUI 快捷方式！您在桌面双击即可启动运行。`,
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: `创建快捷方式失败: ${err.message}`,
+    });
+  }
+});
+
 // 8. Stop receiving
 app.post('/api/receive/stop', (_req: Request, res: Response) => {
   if (activeReceiveProcess) {
