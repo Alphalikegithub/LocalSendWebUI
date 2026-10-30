@@ -1,0 +1,6 @@
+{
+  "name": "LocalSend GUI",
+  "description": "Cross-platform local network file transfer interface with device discovery, batch file sending/receiving, transfer progress tracking, and log monitoring.",
+  "permissions": [],
+  "capabilities": []
+}
