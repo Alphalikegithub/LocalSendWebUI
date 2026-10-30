@@ -194,6 +194,25 @@ export const DevicePanel: React.FC<DevicePanelProps> = ({
           </div>
         </div>
 
+        {/* Malformed IP Check (e.g. 192.168.1.118.115) */}
+        {selectedTarget.split('.').length > 4 && (
+          <div className="text-[11px] text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 p-1.5 rounded border border-amber-200 dark:border-amber-800/60 flex items-center justify-between gap-1">
+            <span>IP 格式有误（包含多余段落）</span>
+            <button
+              type="button"
+              onClick={() => {
+                const parts = selectedTarget.split('.');
+                if (parts.length === 5 && parts[0] === '192' && parts[1] === '168') {
+                  onSelectTarget(`192.168.${parts[3]}.${parts[4]}`);
+                }
+              }}
+              className="text-amber-800 dark:text-amber-200 underline font-bold font-mono"
+            >
+              点击修正为 192.168.{selectedTarget.split('.').slice(-2).join('.')}
+            </button>
+          </div>
+        )}
+
         {/* Discovery refresh button and status */}
         <div className="flex items-center gap-2">
           <button

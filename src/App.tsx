@@ -66,6 +66,8 @@ export function App() {
   const [pendingTransfers, setPendingTransfers] = useState<ReceivedTransfer[]>([]);
   const [transferHistory, setTransferHistory] = useState<ReceivedTransfer[]>([]);
 
+  const [localAddresses, setLocalAddresses] = useState<{ ip: string; name: string }[]>([]);
+  const hasInitializedRef = useRef(false);
   const activeEventSourceRef = useRef<EventSource | null>(null);
 
   // Sync dark mode class with root html
@@ -90,6 +92,9 @@ export function App() {
 
   // 1. Initial startup - fetch real system status, CLI and TLS identity
   useEffect(() => {
+    if (hasInitializedRef.current) return;
+    hasInitializedRef.current = true;
+
     appendLog('LocalSend GUI 已启动。');
 
     const initSystem = async () => {
@@ -100,6 +105,10 @@ export function App() {
           const cliPath = data.cliPath || settings.cliPath;
           const fingerprint = data.fingerprint || '';
           const identityPath = data.identityPath || '';
+
+          if (data.localAddresses) {
+            setLocalAddresses(data.localAddresses);
+          }
 
           setSettings((prev) => ({
             ...prev,
@@ -497,6 +506,7 @@ export function App() {
     <div className="min-h-screen flex flex-col bg-slate-100 dark:bg-slate-900 text-slate-800 dark:text-slate-100 font-sans">
       <Header
         settings={settings}
+        localAddresses={localAddresses}
         onOpenSettings={() => setShowSettingsModal(true)}
         onOpenHistory={() => setShowHistoryDrawer(true)}
         receivedCount={transferHistory.length}

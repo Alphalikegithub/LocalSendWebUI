@@ -39,14 +39,12 @@ const storage = multer.diskStorage({
     cb(null, uploadDir);
   },
   filename: (_req, file, cb) => {
-    // Preserve original filename
     const safeName = Buffer.from(file.originalname, 'latin1').toString('utf8');
     cb(null, `${Date.now()}-${safeName}`);
   },
 });
 const upload = multer({ storage });
 
-// Active state
 interface DiscoveredDevice {
   id: string;
   alias: string;
@@ -85,24 +83,19 @@ function resolveCliPath(): { path: string; found: boolean } {
       try {
         fs.accessSync(candidate, fs.constants.X_OK);
         return { path: candidate, found: true };
-      } catch {
-        // not executable
-      }
+      } catch {}
     }
   }
 
-  // Try `which localsend-cli`
   try {
     const whichOutput = execSync('which localsend-cli 2>/dev/null', { encoding: 'utf8' }).trim();
     if (whichOutput && fs.existsSync(whichOutput)) {
       return { path: whichOutput, found: true };
     }
-  } catch {
-    // not in PATH
-  }
+  } catch {}
 
   return {
-    path: candidates[0], // default path fallback
+    path: candidates[0],
     found: false,
   };
 }
@@ -120,7 +113,6 @@ function resolveIdentity(): { path: string; fingerprint: string; pem: string | n
     if (fs.existsSync(candidate)) {
       try {
         const pem = fs.readFileSync(candidate, 'utf8');
-        // Extract certificate and compute SHA256 fingerprint
         const x509Match = pem.match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/);
         if (x509Match) {
           const cert = new crypto.X509Certificate(x509Match[0]);
@@ -133,7 +125,6 @@ function resolveIdentity(): { path: string; fingerprint: string; pem: string | n
     }
   }
 
-  // Fallback fingerprint
   const defaultFingerprint = crypto
     .createHash('sha256')
     .update(os.hostname() + 'localsend-gui')
@@ -163,20 +154,29 @@ function getLocalIPv4Addresses(): { ip: string; netmask: string; name: string }[
   return list;
 }
 
-// Multicast discovery setup
-function startMulticastListener(onDeviceFound?: (dev: DiscoveredDevice) => void) {
+// Safely close and release UDP port 53317
+function stopMulticastListener() {
   if (multicastSocket) {
+    try {
+      multicastSocket.leaveMembership(MULTICAST_GROUP);
+    } catch {}
     try {
       multicastSocket.close();
     } catch {}
     multicastSocket = null;
   }
+}
+
+// Start temporary UDP listener for discovery
+function startMulticastListener(onDeviceFound?: (dev: DiscoveredDevice) => void) {
+  stopMulticastListener();
 
   try {
     multicastSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
     multicastSocket.on('error', (err) => {
       console.warn('UDP Multicast socket error:', err.message);
+      stopMulticastListener();
     });
 
     multicastSocket.on('message', (msg, rinfo) => {
@@ -187,7 +187,6 @@ function startMulticastListener(onDeviceFound?: (dev: DiscoveredDevice) => void)
         const ownIdentity = resolveIdentity();
 
         if (fingerprint && fingerprint.toUpperCase() === ownIdentity.fingerprint.toUpperCase()) {
-          // Own packet
           return;
         }
 
@@ -197,7 +196,8 @@ function startMulticastListener(onDeviceFound?: (dev: DiscoveredDevice) => void)
           ip: rinfo.address,
           port: json.port || LOCALSEND_PORT,
           deviceModel: json.deviceModel || json.deviceType || 'LocalSend Peer',
-          deviceType: json.deviceType === 'mobile' ? 'mobile' : json.deviceType === 'server' ? 'server' : 'desktop',
+          deviceType:
+            json.deviceType === 'mobile' ? 'mobile' : json.deviceType === 'server' ? 'server' : 'desktop',
           fingerprint,
           isOnline: true,
           lastSeen: Date.now(),
@@ -207,25 +207,37 @@ function startMulticastListener(onDeviceFound?: (dev: DiscoveredDevice) => void)
         if (onDeviceFound) {
           onDeviceFound(dev);
         }
-      } catch {
-        // Not a JSON packet or incompatible
-      }
+      } catch {}
     });
 
     multicastSocket.bind(LOCALSEND_PORT, () => {
       try {
         multicastSocket?.addMembership(MULTICAST_GROUP);
+
+        // Send multicast discovery announcement so peers on LAN reply
+        const identity = resolveIdentity();
+        const announceMsg = Buffer.from(
+          JSON.stringify({
+            alias: os.hostname(),
+            version: '2.1',
+            deviceModel: 'Linux Desktop',
+            deviceType: 'desktop',
+            fingerprint: identity.fingerprint,
+            port: LOCALSEND_PORT,
+            protocol: 'https',
+            download: true,
+            announce: true,
+          })
+        );
+        multicastSocket?.send(announceMsg, 0, announceMsg.length, LOCALSEND_PORT, MULTICAST_GROUP);
       } catch (err: any) {
-        console.warn('Failed to add multicast group membership:', err.message);
+        console.warn('Multicast membership error:', err.message);
       }
     });
   } catch (err: any) {
     console.warn('Could not bind UDP discovery socket:', err.message);
   }
 }
-
-// Start multicast listener initially
-startMulticastListener();
 
 // ==========================================
 // REST API ROUTES
@@ -249,7 +261,7 @@ app.get('/api/system/status', (_req: Request, res: Response) => {
   });
 });
 
-// 2. Discover devices (real UDP listener + subnet probe)
+// 2. Discover devices (mTLS HTTPS + HTTP probe + UDP announce)
 app.get('/api/discover/stream', async (req: Request, res: Response) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -289,27 +301,32 @@ app.get('/api/discover/stream', async (req: Request, res: Response) => {
 
   sendEvent('log', { message: `正在探测 ${ipsToProbe.length} 个局域网地址…`, level: 'info' });
 
-  // Reset or keep discovered devices
+  // Start multicast listener during discovery
   startMulticastListener((dev) => {
     sendEvent('device', dev);
     sendEvent('log', { message: `发现设备：${dev.alias} (${dev.ip})`, level: 'success' });
   });
 
-  // Concurrent HTTPS/HTTP Probing
+  // HTTPS agent with mTLS client certificate and key (CRITICAL for LocalSend v2 handshake)
   const httpsAgent = new https.Agent({
     rejectUnauthorized: false,
-    timeout: 900,
+    cert: identity.pem || undefined,
+    key: identity.pem || undefined,
+    timeout: 1200,
+    keepAlive: false,
   });
 
-  let completedProbes = 0;
-  const concurrency = 40;
-  let activeIndex = 0;
+  const httpAgent = new http.Agent({
+    timeout: 1000,
+    keepAlive: false,
+  });
 
   const probeIp = async (ip: string): Promise<void> => {
     return new Promise((resolve) => {
-      const reqProbe = https.get(
+      // Step A: Try HTTPS mTLS
+      const reqHttps = https.get(
         `https://${ip}:${LOCALSEND_PORT}/api/localsend/v2/info`,
-        { agent: httpsAgent, timeout: 900 },
+        { agent: httpsAgent, timeout: 1200 },
         (response) => {
           let body = '';
           response.on('data', (chunk) => (body += chunk));
@@ -331,6 +348,7 @@ app.get('/api/discover/stream', async (req: Request, res: Response) => {
                 discoveredDevices.set(ip, dev);
                 sendEvent('device', dev);
                 sendEvent('log', { message: `发现设备：${dev.alias} (${ip})`, level: 'success' });
+                return resolve();
               }
             } catch {}
             resolve();
@@ -338,24 +356,68 @@ app.get('/api/discover/stream', async (req: Request, res: Response) => {
         }
       );
 
-      reqProbe.on('error', () => resolve());
-      reqProbe.on('timeout', () => {
-        reqProbe.destroy();
+      reqHttps.on('error', () => {
+        // Step B: Fallback to plain HTTP if peer has encryption disabled
+        const reqHttp = http.get(
+          `http://${ip}:${LOCALSEND_PORT}/api/localsend/v2/info`,
+          { agent: httpAgent, timeout: 1000 },
+          (response) => {
+            let body = '';
+            response.on('data', (chunk) => (body += chunk));
+            response.on('end', () => {
+              try {
+                const info = JSON.parse(body);
+                if (info.alias) {
+                  const dev: DiscoveredDevice = {
+                    id: `${ip}-${LOCALSEND_PORT}`,
+                    alias: info.alias,
+                    ip,
+                    port: LOCALSEND_PORT,
+                    deviceModel: info.deviceModel || 'LocalSend Peer',
+                    deviceType: info.deviceType || 'desktop',
+                    fingerprint: info.fingerprint || '',
+                    isOnline: true,
+                    lastSeen: Date.now(),
+                  };
+                  discoveredDevices.set(ip, dev);
+                  sendEvent('device', dev);
+                  sendEvent('log', { message: `发现设备：${dev.alias} (${ip})`, level: 'success' });
+                }
+              } catch {}
+              resolve();
+            });
+          }
+        );
+        reqHttp.on('error', () => resolve());
+        reqHttp.on('timeout', () => {
+          reqHttp.destroy();
+          resolve();
+        });
+      });
+
+      reqHttps.on('timeout', () => {
+        reqHttps.destroy();
         resolve();
       });
     });
   };
 
+  // Run probes concurrently
+  const concurrency = 40;
+  let activeIndex = 0;
+
   const runWorker = async () => {
     while (activeIndex < ipsToProbe.length) {
       const ip = ipsToProbe[activeIndex++];
       await probeIp(ip);
-      completedProbes++;
     }
   };
 
   const workers = Array.from({ length: concurrency }, () => runWorker());
   await Promise.all(workers);
+
+  // Discovery window finish: release UDP port 53317 immediately
+  stopMulticastListener();
 
   const foundCount = discoveredDevices.size;
   if (foundCount === 0) {
@@ -392,14 +454,28 @@ app.post('/api/send/upload', upload.array('files'), (req: Request, res: Response
 
 // 4. Send files via localsend-cli
 app.post('/api/send/start', (req: Request, res: Response) => {
-  const { target, filePaths, customCliPath } = req.body;
+  let { target, filePaths, customCliPath } = req.body;
 
   if (!target) {
     return res.status(400).json({ error: '缺少目标设备或 IP 地址' });
   }
+
+  // Sanitize target IP if user typed a malformed IP with duplicate octet (e.g. 192.168.1.118.115 -> 192.168.118.115)
+  target = target.trim();
+  const octets = target.split('.');
+  if (octets.length > 4) {
+    // If user accidentally typed 192.168.1.118.115, auto-fix to 192.168.118.115
+    if (octets[0] === '192' && octets[1] === '168' && octets.length === 5) {
+      target = `${octets[0]}.${octets[1]}.${octets[3]}.${octets[4]}`;
+    }
+  }
+
   if (!filePaths || !Array.isArray(filePaths) || filePaths.length === 0) {
     return res.status(400).json({ error: '没有提供要发送的文件路径' });
   }
+
+  // CRITICAL: Release port 53317 before spawning localsend-cli
+  stopMulticastListener();
 
   const cli = customCliPath ? { path: customCliPath, found: fs.existsSync(customCliPath) } : resolveCliPath();
 
@@ -418,7 +494,6 @@ app.post('/api/send/start', (req: Request, res: Response) => {
     level: 'info',
   });
 
-  // Verify CLI binary existence
   if (!cli.found && !fs.existsSync(cli.path)) {
     sendEvent('log', {
       message: `未找到 localsend-cli 可执行文件（${cli.path}），无法启动底层发送进程。请在“设置”中配置正确的 CLI 路径。`,
@@ -446,7 +521,6 @@ app.post('/api/send/start', (req: Request, res: Response) => {
       const lines = text.split(/\r?\n/).filter(Boolean);
 
       for (const line of lines) {
-        // Parse ETA or progress
         if (line.includes('ETA:') || line.includes('/')) {
           sendEvent('progress', { rawLine: line });
         } else {
@@ -512,8 +586,11 @@ app.post('/api/send/cancel', (_req: Request, res: Response) => {
   res.json({ success: true, message: '没有正在执行的发送任务' });
 });
 
-// 6. Launch CLI Receive mode in system terminal or background
+// 6. Launch CLI Receive mode
 app.post('/api/receive/start', (req: Request, res: Response) => {
+  // CRITICAL: Release port 53317 before spawning receive
+  stopMulticastListener();
+
   const { customCliPath } = req.body;
   const cli = customCliPath ? { path: customCliPath, found: fs.existsSync(customCliPath) } : resolveCliPath();
 
@@ -523,7 +600,6 @@ app.post('/api/receive/start', (req: Request, res: Response) => {
     });
   }
 
-  // Check available terminal programs on Linux
   const terminalCandidates = [
     { program: 'x-terminal-emulator', flag: '-e' },
     { program: 'mate-terminal', flag: '-x' },
@@ -570,7 +646,6 @@ app.post('/api/receive/start', (req: Request, res: Response) => {
     }
   }
 
-  // Fallback: spawn directly as background process
   try {
     if (activeReceiveProcess) {
       activeReceiveProcess.kill();
@@ -589,31 +664,6 @@ app.post('/api/receive/start', (req: Request, res: Response) => {
   } catch (err: any) {
     res.status(500).json({ error: `无法启动接收进程: ${err.message}` });
   }
-});
-
-// 7. LocalSend v2 HTTP protocol endpoints (enabling direct peer uploads to this app)
-app.get('/api/localsend/v2/info', (_req: Request, res: Response) => {
-  const identity = resolveIdentity();
-  res.json({
-    alias: os.hostname(),
-    version: '2.1',
-    deviceModel: 'LocalSend GUI Web Server',
-    deviceType: 'desktop',
-    fingerprint: identity.fingerprint,
-    download: true,
-  });
-});
-
-app.post('/api/localsend/v2/prepare-upload', (req: Request, res: Response) => {
-  const sessionId = crypto.randomUUID();
-  const info = req.body.info;
-  const files = req.body.files;
-
-  console.log(`[LocalSend Protocol] Incoming upload session ${sessionId} from ${info?.alias || 'peer'}`);
-  res.json({
-    sessionId,
-    files: files ? Object.keys(files).reduce((acc: any, key) => ({ ...acc, [key]: key }), {}) : {},
-  });
 });
 
 // ==========================================
@@ -638,7 +688,17 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[LocalSend GUI] Running at http://0.0.0.0:${PORT}`);
+    const ips = getLocalIPv4Addresses();
+    console.log('\n=============================================================');
+    console.log('  LocalSend GUI 服务已启动！');
+    console.log('  ');
+    console.log(`  本机访问地址:       http://localhost:${PORT}`);
+    if (ips.length > 0) {
+      ips.forEach((iface) => {
+        console.log(`  同局域网访问地址:   http://${iface.ip}:${PORT}  (${iface.name})`);
+      });
+    }
+    console.log('=============================================================\n');
   });
 }
 

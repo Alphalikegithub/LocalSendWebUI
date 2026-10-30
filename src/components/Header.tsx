@@ -1,9 +1,10 @@
-import React from 'react';
-import { Send, Radio, Settings, History, ShieldCheck, Moon, Sun, Laptop } from 'lucide-react';
+import React, { useState } from 'react';
+import { Send, Radio, Settings, History, ShieldCheck, Moon, Sun, Laptop, Globe, Copy, Check } from 'lucide-react';
 import { AppSettings } from '../types';
 
 interface HeaderProps {
   settings: AppSettings;
+  localAddresses: { ip: string; name: string }[];
   onOpenSettings: () => void;
   onOpenHistory: () => void;
   receivedCount: number;
@@ -13,12 +14,22 @@ interface HeaderProps {
 
 export const Header: React.FC<HeaderProps> = ({
   settings,
+  localAddresses,
   onOpenSettings,
   onOpenHistory,
   receivedCount,
   darkMode,
   onToggleDarkMode,
 }) => {
+  const [copiedUrl, setCopiedUrl] = useState(false);
+  const primaryLanIp = localAddresses[0]?.ip;
+
+  const handleCopyUrl = (url: string) => {
+    navigator.clipboard.writeText(url);
+    setCopiedUrl(true);
+    setTimeout(() => setCopiedUrl(false), 2000);
+  };
+
   return (
     <header className="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 shadow-xs">
       <div className="flex items-center gap-3">
@@ -51,6 +62,33 @@ export const Header: React.FC<HeaderProps> = ({
             </span>
           </p>
         </div>
+      </div>
+
+      {/* Middle: Access URLs indicator */}
+      <div className="hidden md:flex items-center gap-2 bg-slate-50 dark:bg-slate-900/60 px-3 py-1 rounded-full border border-slate-200 dark:border-slate-700 text-xs">
+        <Globe className="h-3.5 w-3.5 text-teal-600" />
+        <span className="text-slate-500">本机访问:</span>
+        <button
+          onClick={() => handleCopyUrl('http://localhost:3000')}
+          className="font-mono text-teal-600 hover:text-teal-700 dark:text-teal-400 font-medium hover:underline flex items-center gap-1"
+          title="点击复制访问地址"
+        >
+          <span>http://localhost:3000</span>
+          {copiedUrl ? <Check className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3 opacity-60" />}
+        </button>
+        {primaryLanIp && (
+          <>
+            <span className="text-slate-300 dark:text-slate-600">|</span>
+            <span className="text-slate-500">局域网:</span>
+            <button
+              onClick={() => handleCopyUrl(`http://${primaryLanIp}:3000`)}
+              className="font-mono text-slate-700 dark:text-slate-300 hover:text-teal-600 font-medium hover:underline"
+              title="同局域网手机或其他电脑访问地址"
+            >
+              http://{primaryLanIp}:3000
+            </button>
+          </>
+        )}
       </div>
 
       <div className="flex items-center gap-2">
