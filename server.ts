@@ -178,7 +178,7 @@ function stopMulticastListener() {
 }
 
 // Force clean any zombie or stale process holding port 53317 on Linux
-function forceReleasePort53317() {
+async function forceReleasePort53317(): Promise<void> {
   stopMulticastListener();
 
   if (activeReceiveProcess) {
@@ -194,12 +194,25 @@ function forceReleasePort53317() {
     activeSendProcess = null;
   }
 
+  // 1. Terminate all lingering localsend-cli & pty_runner processes
+  try {
+    execSync('pkill -9 -f localsend-cli 2>/dev/null');
+  } catch {}
+  try {
+    execSync('pkill -9 -f pty_runner.py 2>/dev/null');
+  } catch {}
+  try {
+    execSync("ss -lptn 'sport = :53317' 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | xargs -r kill -9 2>/dev/null");
+  } catch {}
   try {
     execSync('fuser -k 53317/tcp 53317/udp 2>/dev/null');
   } catch {}
   try {
     execSync('killall -9 localsend-cli 2>/dev/null');
   } catch {}
+
+  // 2. Allow Linux network stack & socket TIME_WAIT state to clear completely
+  await new Promise((resolve) => setTimeout(resolve, 450));
 }
 
 // Start temporary UDP listener during discovery
@@ -513,7 +526,7 @@ app.post('/api/send/upload', upload.array('files'), (req: Request, res: Response
 });
 
 // 4. Send files via localsend-cli
-app.post('/api/send/start', (req: Request, res: Response) => {
+app.post('/api/send/start', async (req: Request, res: Response) => {
   let { target, filePaths, customCliPath } = req.body;
 
   if (!target) {
@@ -532,7 +545,7 @@ app.post('/api/send/start', (req: Request, res: Response) => {
   }
 
   // Force clean port 53317 to ensure localsend-cli won't collide with previous processes
-  forceReleasePort53317();
+  await forceReleasePort53317();
 
   const cli = customCliPath ? { path: customCliPath, found: fs.existsSync(customCliPath) } : resolveCliPath();
 
@@ -643,9 +656,9 @@ app.post('/api/send/cancel', (_req: Request, res: Response) => {
   res.json({ success: true, message: '没有正在执行的发送任务' });
 });
 
-// 6. Seamless Background Receive Mode (No Terminal Needed!)
-app.post('/api/receive/start', (req: Request, res: Response) => {
-  forceReleasePort53317();
+// 6. Seamless Background Receive Mode (using PTY runner for Rust TTY terminal mode)
+app.post('/api/receive/start', async (req: Request, res: Response) => {
+  await forceReleasePort53317();
 
   const { customCliPath, autoAccept, saveDir } = req.body;
   if (saveDir) {
@@ -667,10 +680,19 @@ app.post('/api/receive/start', (req: Request, res: Response) => {
   try {
     receiveStdoutBuffer = '';
 
-    // Spawn localsend-cli directly in the download directory with piped stdin/stdout
-    activeReceiveProcess = spawn(cli.path, [], {
+    // If pty_runner.py is available on Linux, launch through genuine PTY so Rust crossterm/inquire accepts input!
+    const ptyRunner = path.join(__dirname, 'pty_runner.py');
+    let spawnCmd = cli.path;
+    let spawnArgs: string[] = [];
+
+    if (fs.existsSync(ptyRunner) && process.platform !== 'win32') {
+      spawnCmd = 'python3';
+      spawnArgs = [ptyRunner, cli.path];
+    }
+
+    activeReceiveProcess = spawn(spawnCmd, spawnArgs, {
       cwd: customDownloadDir,
-      env: { ...process.env },
+      env: { ...process.env, TERM: 'xterm-256color', PYTHONUNBUFFERED: '1' },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
@@ -678,8 +700,9 @@ app.post('/api/receive/start', (req: Request, res: Response) => {
       const text = data.toString('utf8');
       receiveStdoutBuffer += text;
 
-      // Broadcast raw log lines to UI
-      const lines = text.split(/\r?\n/).filter(Boolean);
+      // Broadcast raw log lines to UI (stripping ANSI escapes for clean log view)
+      const cleanText = text.replace(/\u001b\[[0-9;]*[a-zA-Z]/g, '');
+      const lines = cleanText.split(/\r?\n/).filter(Boolean);
       for (const line of lines) {
         broadcastReceive('log', { message: line, level: 'info' });
       }
@@ -687,32 +710,60 @@ app.post('/api/receive/start', (req: Request, res: Response) => {
       // Check for IPv6 link-local connection abort
       if (text.includes('os error 103') || text.includes('RsHttpClientError')) {
         broadcastReceive('log', {
-          message: '【传输中断诊断】检测到连接被系统中止 (os error 103)。这通常是因为发送方使用了 IPv6 Link-Local (fe80::) 路由失败。请在发送方手机 LocalSend 设置中选择“仅使用 IPv4”，或在发送方手动输入电脑的 IPv4 地址发送。',
+          message: '【传输诊断】连接被对端中止 (os error 103)。这通常是因为发送方设备默认开启了 IPv6 Link-Local 导致路由不通。请在发送端手机 LocalSend 设置中选择“仅使用 IPv4”，或在发送端直接指定本机 IPv4 地址。',
           level: 'warn',
         });
       }
 
       // Check if CLI is prompting: "Accept? Y/N/P"
-      if (receiveStdoutBuffer.includes('Accept? Y/N/P') || receiveStdoutBuffer.includes('Accept?')) {
+      const cleanAll = receiveStdoutBuffer.replace(/\u001b\[[0-9;]*[a-zA-Z]/g, '');
+      if (cleanAll.includes('Accept? Y/N/P') || cleanAll.includes('Accept?')) {
         // Parse sender & file info
-        const senderMatch = receiveStdoutBuffer.match(/R\s+([^\r\n]+)/);
-        const filesMatch = receiveStdoutBuffer.match(/Files\s*\(([0-9]+)[^:]*\):/i);
+        const senderMatch = cleanAll.match(/R\s+([^\r\n]+)/);
+        const filesMatch = cleanAll.match(/Files\s*\(([0-9]+)[^:]*\):/i);
         const senderName = senderMatch ? senderMatch[1].trim() : '局域网设备';
         const fileCount = filesMatch ? parseInt(filesMatch[1]) : 1;
+
+        // Parse individual file names
+        const fileList: { name: string; size: number }[] = [];
+        const linesBuf = cleanAll.split(/\r?\n/);
+        let inFilesSection = false;
+        for (const line of linesBuf) {
+          if (line.includes('Files (')) {
+            inFilesSection = true;
+            continue;
+          }
+          if (inFilesSection && line.includes('Accept?')) {
+            break;
+          }
+          if (inFilesSection && line.trim()) {
+            const trimmed = line.trim();
+            fileList.push({ name: trimmed, size: 0 });
+          }
+        }
 
         const promptData = {
           id: `prompt-${Date.now()}`,
           sender: senderName,
           fileCount,
-          rawText: receiveStdoutBuffer,
+          files: fileList.length > 0 ? fileList : [{ name: `文件 (${fileCount} 项)`, size: 0 }],
+          rawText: cleanAll,
           downloadDir: customDownloadDir,
         };
 
         if (receiveAutoAccept) {
-          // Auto-accept directly!
-          activeReceiveProcess?.stdin?.write('y\n');
+          // Auto-accept: send 'p\n' (pair & accept) and 'y\n' (accept)
+          try {
+            activeReceiveProcess?.stdin?.write('p\n');
+            setTimeout(() => {
+              try {
+                activeReceiveProcess?.stdin?.write('y\n');
+              } catch {}
+            }, 100);
+          } catch {}
+
           broadcastReceive('log', {
-            message: `【自动接收已触发】已自动接受来自 ${senderName} 的文件传输请求。`,
+            message: `【自动接收已触发】已自动接受并信任来自 ${senderName} 的文件传输请求。`,
             level: 'success',
           });
         } else {
@@ -758,20 +809,65 @@ app.post('/api/receive/start', (req: Request, res: Response) => {
 
 // 7. User responds to incoming transfer prompt right in the web UI
 app.post('/api/receive/respond', (req: Request, res: Response) => {
-  const { action } = req.body; // 'y' (accept), 'n' (decline), 'p' (pair)
+  const { action } = req.body; // 'p' (accept & pair), 'y' (accept once), 'n' (decline)
   if (!activeReceiveProcess || !activeReceiveProcess.stdin) {
     return res.status(400).json({ error: '当前没有正在运行的接收进程' });
   }
 
-  const choice = (action || 'y').toLowerCase();
-  activeReceiveProcess.stdin.write(`${choice}\n`);
+  const choice = (action || 'p').toLowerCase();
+  try {
+    activeReceiveProcess.stdin.write(`${choice}\n`);
+    setTimeout(() => {
+      try {
+        activeReceiveProcess?.stdin?.write(`${choice.toUpperCase()}\n`);
+      } catch {}
+    }, 50);
+  } catch (err: any) {
+    console.error('Error writing to stdin:', err);
+  }
 
   broadcastReceive('log', {
-    message: choice === 'y' || choice === 'p' ? '已确认接受文件传输。' : '已拒绝文件传输请求。',
-    level: choice === 'y' || choice === 'p' ? 'success' : 'warn',
+    message:
+      choice === 'p'
+        ? '已接受并永久配对信任该设备 (P)。'
+        : choice === 'y'
+        ? '已确认接受本次文件传输 (Y)。'
+        : '已拒绝文件传输请求 (N)。',
+    level: choice === 'n' ? 'warn' : 'success',
   });
 
   res.json({ success: true, action: choice });
+});
+
+// 7b. Launch in system desktop terminal (Optional alternative)
+app.post('/api/system/terminal-receive', async (_req: Request, res: Response) => {
+  await forceReleasePort53317();
+  const cli = resolveCliPath();
+  ensureDirectories();
+
+  const terminals = [
+    { bin: 'x-terminal-emulator', args: ['-e', `${cli.path}`] },
+    { bin: 'gnome-terminal', args: ['--', `${cli.path}`] },
+    { bin: 'konsole', args: ['-e', `${cli.path}`] },
+    { bin: 'xfce4-terminal', args: ['-e', `${cli.path}`] },
+    { bin: 'xterm', args: ['-e', `${cli.path}`] },
+  ];
+
+  for (const term of terminals) {
+    try {
+      const which = execSync(`which ${term.bin} 2>/dev/null`, { encoding: 'utf8' }).trim();
+      if (which) {
+        spawn(term.bin, term.args, {
+          cwd: customDownloadDir,
+          detached: true,
+          stdio: 'ignore',
+        });
+        return res.json({ success: true, terminal: term.bin, downloadDir: customDownloadDir });
+      }
+    } catch {}
+  }
+
+  res.status(500).json({ error: '未找到可用的图形桌面终端模拟器 (如 gnome-terminal, konsole, xterm)' });
 });
 
 // 8. Stop receiving

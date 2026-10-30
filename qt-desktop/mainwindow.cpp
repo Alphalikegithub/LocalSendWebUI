@@ -43,6 +43,7 @@
 #include <QSslSocket>
 #include <QStandardPaths>
 #include <QStatusBar>
+#include <QThread>
 #include <QTime>
 #include <QTimer>
 #include <QUdpSocket>
@@ -484,6 +485,12 @@ void MainWindow::sendSelectedFiles()
         return;
     }
 
+    QString cleanTarget = target.trimmed();
+    const QStringList octets = cleanTarget.split(QLatin1Char('.'));
+    if (octets.size() == 5 && octets[0] == QStringLiteral("192") && octets[1] == QStringLiteral("168")) {
+        cleanTarget = QStringLiteral("192.168.%1.%2").arg(octets[3], octets[4]);
+    }
+
     const QStringList paths = selectedPaths();
     if (paths.isEmpty()) {
         QMessageBox::warning(this, tr("没有文件"),
@@ -501,12 +508,16 @@ void MainWindow::sendSelectedFiles()
     m_cancelRequested = false;
     m_sendBuffer.clear();
 
+    // Release port 53317 and allow sockets to close
+    QProcess::execute(QStringLiteral("pkill"), QStringList() << QStringLiteral("-9") << QStringLiteral("-f") << QStringLiteral("localsend-cli"));
+    QThread::msleep(350);
+
     m_cliPath = cli;
     m_sendProcess->setProgram(cli);
     QStringList arguments;
     arguments << QStringLiteral("send")
               << QStringLiteral("--to")
-              << target
+              << cleanTarget
               << paths;
     m_sendProcess->setArguments(arguments);
     m_sendProcess->setWorkingDirectory(QDir::homePath());

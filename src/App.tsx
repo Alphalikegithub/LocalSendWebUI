@@ -563,7 +563,7 @@ export function App() {
     appendLog(`收到来自 富有的椰子 (192.168.118.115) 的文件传输请求（VID20260627073253.mp4，129.1 MB）。`, 'warn');
   };
 
-  const handleAcceptTransfer = async (id: string) => {
+  const handleAcceptTransfer = async (id: string, action: 'p' | 'y' = 'p') => {
     const req = pendingTransfers.find((t) => t.id === id);
     setPendingTransfers((prev) => prev.filter((t) => t.id !== id));
 
@@ -571,9 +571,14 @@ export function App() {
       await fetch('/api/receive/respond', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'y' }),
+        body: JSON.stringify({ action }),
       });
-      appendLog('已在界面中确认接受传输请求！', 'success');
+      appendLog(
+        action === 'p'
+          ? '已接受传输并永久信任该设备 (P)！'
+          : '已在界面中确认接受本次传输请求 (Y)！',
+        'success'
+      );
       if (req) {
         setTransferHistory((prev) => [{ ...req, status: 'completed' }, ...prev]);
       }

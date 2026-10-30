@@ -11,6 +11,8 @@ import {
   FileText,
   Clock,
   Sparkles,
+  ShieldCheck,
+  Terminal,
 } from 'lucide-react';
 import { AppSettings, ReceivedTransfer } from '../types';
 import { formatBytes } from '../utils/format';
@@ -23,7 +25,7 @@ interface ReceiveModalProps {
   autoAccept: boolean;
   onToggleAutoAccept: (enabled: boolean) => void;
   pendingTransfers: ReceivedTransfer[];
-  onAcceptTransfer: (transferId: string) => void;
+  onAcceptTransfer: (transferId: string, action?: 'p' | 'y') => void;
   onDeclineTransfer: (transferId: string) => void;
   onOpenFolder: () => void;
 }
@@ -42,6 +44,22 @@ export const ReceiveModal: React.FC<ReceiveModalProps> = ({
 }) => {
   const [showQr, setShowQr] = useState(false);
   const [downloadedFiles, setDownloadedFiles] = useState<{ name: string; size: number; mtime: number }[]>([]);
+  const [terminalLaunching, setTerminalLaunching] = useState(false);
+
+  const handleLaunchTerminal = async () => {
+    setTerminalLaunching(true);
+    try {
+      const res = await fetch('/api/system/terminal-receive', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || '未能启动终端');
+      }
+    } catch (e: any) {
+      alert(`启动终端失败: ${e.message}`);
+    } finally {
+      setTerminalLaunching(false);
+    }
+  };
 
   // Fetch downloaded files list
   useEffect(() => {
@@ -164,20 +182,30 @@ export const ReceiveModal: React.FC<ReceiveModalProps> = ({
                     ))}
                   </div>
 
-                  <div className="flex justify-end gap-2 pt-1">
+                  <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
                     <button
                       onClick={() => onDeclineTransfer(req.id)}
-                      className="px-3 py-1.5 text-xs rounded border border-rose-200 dark:border-rose-800 bg-white dark:bg-slate-800 text-rose-600 hover:bg-rose-50 font-medium transition-colors flex items-center gap-1"
+                      className="px-2.5 py-1.5 text-xs rounded border border-rose-200 dark:border-rose-800 bg-white dark:bg-slate-800 text-rose-600 hover:bg-rose-50 font-medium transition-colors flex items-center gap-1"
+                      title="拒绝此次传输"
                     >
                       <Ban className="h-3.5 w-3.5" />
                       <span>拒绝 (N)</span>
                     </button>
                     <button
-                      onClick={() => onAcceptTransfer(req.id)}
-                      className="px-4 py-1.5 text-xs rounded bg-teal-600 hover:bg-teal-700 text-white font-bold transition-colors flex items-center gap-1 shadow-xs"
+                      onClick={() => onAcceptTransfer(req.id, 'y')}
+                      className="px-3 py-1.5 text-xs rounded border border-teal-300 dark:border-teal-700 bg-teal-50 dark:bg-slate-800 text-teal-700 dark:text-teal-300 hover:bg-teal-100 font-bold transition-colors flex items-center gap-1"
+                      title="仅接受本次传输，下次仍会询问"
                     >
                       <Check className="h-3.5 w-3.5" />
-                      <span>接受并保存 (Y)</span>
+                      <span>仅本次接收 (Y)</span>
+                    </button>
+                    <button
+                      onClick={() => onAcceptTransfer(req.id, 'p')}
+                      className="px-3.5 py-1.5 text-xs rounded bg-teal-600 hover:bg-teal-700 text-white font-bold transition-colors flex items-center gap-1 shadow-xs"
+                      title="接受并信任此设备指纹，未来无需再次确认"
+                    >
+                      <ShieldCheck className="h-3.5 w-3.5" />
+                      <span>接受并信任配对 (P)</span>
                     </button>
                   </div>
                 </div>
@@ -237,9 +265,18 @@ export const ReceiveModal: React.FC<ReceiveModalProps> = ({
 
         {/* Footer */}
         <div className="px-4 py-3 bg-slate-50 dark:bg-slate-900 border-t border-slate-200 dark:border-slate-700 flex justify-between items-center text-xs shrink-0">
-          <span className="text-slate-500 dark:text-slate-400">
-            无需开启系统终端，接收进程在后台静默运行
-          </span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleLaunchTerminal}
+              disabled={terminalLaunching}
+              className="text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 flex items-center gap-1 font-medium hover:underline text-[11px]"
+              title="在独立的系统桌面终端（gnome-terminal/xterm 等）中启动"
+            >
+              <Terminal className="h-3.5 w-3.5 text-slate-400" />
+              <span>{terminalLaunching ? '正在打开…' : '切换到桌面独立终端窗口'}</span>
+            </button>
+          </div>
           <button
             onClick={onClose}
             className="px-3.5 py-1.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-200 rounded hover:bg-slate-300 dark:hover:bg-slate-600 font-medium"
