@@ -615,9 +615,9 @@ export function App() {
         onToggleDarkMode={() => setDarkMode(!darkMode)}
       />
 
-      <main className="flex-1 p-3 md:p-4 flex flex-col gap-3 max-w-7xl w-full mx-auto overflow-hidden">
+      <main className="flex-1 p-3 md:p-4 flex flex-col gap-3 max-w-7xl w-full mx-auto overflow-y-auto min-h-0">
         {/* Top Splitter */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 min-h-[300px]">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 min-h-[280px]">
           <div className="lg:col-span-4 h-full">
             <DevicePanel
               devices={devices}
@@ -642,8 +642,8 @@ export function App() {
           </div>
         </div>
 
-        {/* Real-time Console Log */}
-        <div className="flex-1 min-h-[160px] max-h-[320px]">
+        {/* Real-time Console Log with stable height and full visibility */}
+        <div className="h-[220px] md:h-[250px] shrink-0 min-h-0">
           <LogPanel logs={logs} onClearLogs={() => setLogs([])} />
         </div>
       </main>
